@@ -29,6 +29,7 @@ import org.apache.spark.ml.classification.ClassificationModel
 import org.apache.spark.ml.classification.DecisionTreeClassifier
 import org.apache.spark.ml.classification.MultilayerPerceptronClassifier
 import org.apache.spark.ml.classification.LogisticRegression
+import scala.collection.mutable.Queue
 
 
 /**
@@ -155,7 +156,7 @@ object MainMLlibTest {
               if(id1 != id2) {
                 // Compute collisions and distance
                 val e2 = elements(id2)              
-                var collisioned = ArrayBuffer[Int]()
+                var collisioned = Queue[Int]()
                 val clshit = e1.label == e2.label
                 neighDist(id1, id2) = 0 // Init the distance counter
                 e1.features.foreachActive{ (index, value) =>
@@ -166,7 +167,11 @@ object MainMLlibTest {
                    }
                    if(dist == 0){
                        marginal(index) += 1
+                       val it = collisioned.iterator
+                       while(it.hasNext)
+                         joint(collisioned(it.next), collisioned(index)) += 1
                        collisioned += index
+                       //collisioned += index
                    }
                    neighDist(id1, id2) += dist
                 }
@@ -176,15 +181,19 @@ object MainMLlibTest {
                 // Count matches in output feature
                 if(clshit){          
                   marginal(last) += 1
-                  collisioned += last
+                  val it = collisioned.iterator
+                  while(it.hasNext)
+                         joint(collisioned(it.next), collisioned(last)) += 1
+                  //collisioned += last
                 }
                 
+                
                 // Generate combinations and update joint collisions counter
-                (0 until collisioned.size).map{f1 => 
+                /*(0 until collisioned.size).map{f1 => 
                   (f1 + 1 until collisioned.size).map{ f2 =>
                     joint(collisioned(f1), collisioned(f2)) += 1
                   }         
-                }
+                }*/
                 total.add(1L) // use to compute likelihoods (denom)
               }
             } else {
@@ -257,7 +266,11 @@ object MainMLlibTest {
     val outRC = reliefColl.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
     val outR = relief.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
     val mRMRmodel = fitMRMR(inputData)
-
+    
+    println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
+    println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
+    println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
+    
     val mrmrAcc = kCVPerformance(inputData, mRMRmodel, "nb")
     val relCAcc = kCVPerformance(inputData, reliefCollModel, "nb")   
     val relAcc = kCVPerformance(inputData, reliefModel, "nb")   
@@ -316,7 +329,7 @@ object MainMLlibTest {
     val reducedData = if(fsmodel != null) {
       fsmodel.transform(df)
     } else {
-      inputCol = "features"
+      inputCol = inputLabel
       df
     }
     println("Reduced schema: " + reducedData.schema)
@@ -416,7 +429,7 @@ object MainMLlibTest {
       })
       
       // select the best feature and remove from the whole set of features
-      val (max, maxi) = pool.par.zipWithIndex.filter(_._1.valid).maxBy(_._1)
+      val (max, maxi) = pool.zipWithIndex.filter(_._1.valid).sortBy(c => (-c._1.score, c._2)).head
       
       if (maxi != -1) {
         selected = F(maxi, max.score) +: selected
@@ -425,7 +438,8 @@ object MainMLlibTest {
         moreFeat = false
       }
     }
-    val reliefNoColl = reliefRanking.sortBy(-_._2).slice(0, nselect).map{ case(id, score) => F(id,score)}.toSeq
+    val reliefNoColl = reliefRanking.sortBy(r => (-r._2, r._1))
+        .slice(0, nselect).map{ case(id, score) => F(id,score)}.toSeq
     (selected.reverse, reliefNoColl)  
   }
   
@@ -447,6 +461,8 @@ object MainMLlibTest {
     val pipeline = new Pipeline().setStages(indexers)
     val typedDF = pipeline.fit(df).transform(df).drop(stringTypes: _*)
 
+    println("Indexed Schema: " + typedDF.schema)
+    
     // Clean Label Column
     val cleanedDF = TestHelper.cleanLabelCol(typedDF, clsLabel)
     clsLabel = clsLabel + TestHelper.INDEX_SUFFIX
@@ -477,7 +493,7 @@ object MainMLlibTest {
       
       val model = discretizer.fit(processedDF)
       processedDF = model.transform(processedDF)
-      processedDF.show
+      processedDF.show(100)
       categorical = true
     }
     processedDF
