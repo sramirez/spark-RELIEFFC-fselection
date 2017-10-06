@@ -30,6 +30,7 @@ import org.apache.spark.ml.classification.DecisionTreeClassifier
 import org.apache.spark.ml.classification.MultilayerPerceptronClassifier
 import org.apache.spark.ml.classification.LogisticRegression
 import scala.collection.mutable.Queue
+import breeze.linalg.normalize
 
 
 /**
@@ -116,7 +117,7 @@ object MainMLlibTest {
     println("Schema: " + df.schema)
     
     //val elements = rdd.collect
-    val nf = rdd.first.features.size + 1
+    val nf = rdd.first.features.size
     val nelems = rdd.count()
     //val belems = rdd.context.broadcast(elements)
     
@@ -136,7 +137,7 @@ object MainMLlibTest {
     
     val reliefRanking = rdd.mapPartitions { it =>
         
-        val reliefWeights = breeze.linalg.DenseVector.fill(nf - 1){0.0f}
+        val reliefWeights = breeze.linalg.DenseVector.fill(nf){0.0f}
         val marginal = breeze.linalg.DenseVector.zeros[Long](nf)
         val last = marginal.size - 1
         val joint = breeze.linalg.DenseMatrix.zeros[Long](nf, nf)
@@ -155,9 +156,7 @@ object MainMLlibTest {
             if(neighDist(id2, id1) < 0){
               if(id1 != id2) {
                 // Compute collisions and distance
-                val e2 = elements(id2)              
-                var collisioned = Queue[Int]()
-                val clshit = e1.label == e2.label
+                val e2 = elements(id2)
                 neighDist(id1, id2) = 0 // Init the distance counter
                 e1.features.foreachActive{ (index, value) =>
                    val dist = if(norminal){
@@ -165,60 +164,51 @@ object MainMLlibTest {
                    }  else {
                      math.pow(value - e2.features(index), 2) 
                    }
-                   if(dist == 0){
-                       marginal(index) += 1
-                       val it = collisioned.iterator
-                       while(it.hasNext)
-                         joint(it.next, index) += 1
-                       collisioned += index
-                       //collisioned += index
-                   }
                    neighDist(id1, id2) += dist
                 }
                 neighDist(id1, id2) = math.sqrt(neighDist(id1, id2))  
                 topk(elements(id2).label.toInt) += neighDist(id1, id2) -> id2
-                
-                // Count matches in output feature
-                if(clshit){          
-                  marginal(last) += 1
-                  val it = collisioned.iterator
-                  while(it.hasNext)
-                         joint(it.next, last) += 1
-                  //collisioned += last
-                }
-                
-                
-                // Generate combinations and update joint collisions counter
-                /*(0 until collisioned.size).map{f1 => 
-                  (f1 + 1 until collisioned.size).map{ f2 =>
-                    joint(collisioned(f1), collisioned(f2)) += 1
-                  }         
-                }*/
-                total.add(1L) // use to compute likelihoods (denom)
               }
             } else {
               topk(elements(id2).label.toInt) += neighDist(id2, id1) -> id2              
             }                      
         }
-        // RELIEF-F computations        
-        e1.features.foreachActive{ case (index, value) =>
-          val weight = (0 until nClasses).map { cls => 
-            val sum = topk(cls).map{ case(_, id2) =>
-               if(norminal){
-                 if (value != elements(id2).features(index)) 1 else 0
-               }  else {
-                 math.pow(value - elements(id2).features(index), 2) 
-               }
-            }.sum
-            if(cls != elements(id1).label){
-              sum.toFloat * bpriorClass.value.getOrElse(cls, 0.0f) / topk(cls).size 
-            } else {
-              -sum.toFloat / topk(cls).size 
-            }
-          }.sum
-          reliefWeights(index) += weight       
+        // RELIEF-F computations (per neighbor)       
+        val counter = Array.fill[Float](nf, nClasses)(0.0f)
+        (0 until nClasses).foreach { cls => 
+            topk(cls).foreach{ case(_, id2) =>
+              var collisioned = Queue[Int]()
+              e1.features.foreachActive{ case (index, value) =>                
+                 val dist = if(norminal){
+                   if (value != elements(id2).features(index)) 1 else 0
+                 }  else {
+                   value - elements(id2).features(index) 
+                 }
+                 if(dist == 0) {
+                   marginal(index) += 1
+                   val it = collisioned.iterator
+                   while(it.hasNext)
+                     joint(it.next, index) += 1
+                   collisioned += index
+                 }
+                 counter(index)(cls) += dist.toFloat 
+              }              
+              total.add(1L) // use to compute likelihoods (denom)
+          }       
         }
-      }
+        // RELIEF-F computations (total weight)       
+        (0 until nClasses).foreach { cls =>
+          e1.features.foreachActive{ case (index, value) =>       
+            if(cls != e1.label){
+              reliefWeights(index) += counter(index)(cls) * bpriorClass.value.getOrElse(cls, 0.0f) / topk(cls).size 
+            } else {
+              reliefWeights(index) -= counter(index)(cls) / topk(cls).size 
+            }
+          }
+        }
+        
+      }   
+        
       // update accumulated matrices  
       accMarginal.add(marginal)
       accJoint.add(joint)
@@ -229,7 +219,6 @@ object MainMLlibTest {
     val avgRelief = reliefRanking.values.mean()
     val stdRelief = reliefRanking.values.stdev()
     val normalizedRelief = reliefRanking.mapValues(score => ((score - avgRelief) / stdRelief).toFloat).collect()
-    
   
     val marginal = accMarginal.value.mapValues(_.toFloat) 
     marginal :/= total.value.toFloat 
@@ -239,8 +228,8 @@ object MainMLlibTest {
     // Compute mutual information using collisions with and without class
     val redundancyMatrix = breeze.linalg.DenseMatrix.zeros[Float](nf, nf)
     joint.activeIterator.foreach { case((i1,i2), value) =>
-      if(i1 < i2 && i1 != nf - 1 && i2 != nf - 1){
-        val red = value * log2(value / (marginal(i1) * marginal(i2))).toFloat              
+      if(i1 < i2){
+        val red = if(value > 0) value * log2(value / (marginal(i1) * marginal(i2))).toFloat else 0
         redundancyMatrix(i1, i2) = red
         redundancyMatrix(i2, i1) = red        
       }        
@@ -403,7 +392,7 @@ object MainMLlibTest {
     
     // Initialize all (except the class) criteria with the relevance values
     val criterionFactory = new InfoThCriterionFactory("mrmr")
-    val pool = Array.fill[InfoThCriterion](nfeatures - 1) {
+    val pool = Array.fill[InfoThCriterion](nfeatures) {
       val crit = criterionFactory.getCriterion.init(Float.NegativeInfinity)
       crit.setValid(false)
     }
