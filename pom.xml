@@ -3,7 +3,7 @@
   <version>1.4.0</version>
   <name>${project.artifactId}</name>
   <groupId>sramirez</groupId>
-  <artifactId>spark-infotheoretic-feature-selection</artifactId>
+  <artifactId>spark-RELIEFFC-fselection</artifactId>
   <inceptionYear>2016</inceptionYear>
   <properties>
     <maven.compiler.source>1.6</maven.compiler.source>

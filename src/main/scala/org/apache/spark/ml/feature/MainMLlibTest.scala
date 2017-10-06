@@ -84,7 +84,7 @@ object MainMLlibTest {
     padded = params.getOrElse("padded", "2").toInt
     classLastIndex = params.getOrElse("class-last", "false").toBoolean
     firstHeader = params.getOrElse("header", "false").toBoolean
-    k = params.getOrElse("k", "5").toInt
+    k = params.getOrElse("k", "10").toInt
     nselect = params.getOrElse("nselect", "10").toInt
     categorical = params.getOrElse("categorical", "false").toBoolean
     
@@ -109,6 +109,8 @@ object MainMLlibTest {
       case Row(label: Double, features: Vector) =>
         LabeledPoint(label, features)
     }.repartition(nPartitions).cache //zipwithUniqueIndexs
+    
+    println("Discretized: " + rdd.map(_.features).take(100).mkString("\n"))
     println("rdd: " + rdd.first().toString())   
     
     //Dataframe version
@@ -144,13 +146,14 @@ object MainMLlibTest {
         val elements = it.toArray
         val neighDist = breeze.linalg.DenseMatrix.fill(
               elements.size, elements.size){Double.MinValue}
-        val ordering = Ordering[Double].on[(Double, Int)](_._1)
+        // BPQ replace always the lowest, so we have to change the order (importante dejar el -1)
+        val ordering = Ordering[Double].on[(Double, Int)](-_._1) 
         
-        (0 until elements.size).map{ id1 =>
+        (0 until elements.size).foreach{ id1 =>
           val e1 = elements(id1)
           var topk = Array.fill[BoundedPriorityQueue[(Double, Int)]](nClasses)(
                 new BoundedPriorityQueue[(Double, Int)](knn)(ordering))
-          (0 until elements.size).map{ id2 => 
+          (0 until elements.size).foreach{ id2 => 
             
             if(neighDist(id2, id1) < 0){
               if(id1 != id2) {
@@ -176,7 +179,10 @@ object MainMLlibTest {
                    neighDist(id1, id2) += dist
                 }
                 neighDist(id1, id2) = math.sqrt(neighDist(id1, id2))  
+                //println("topk: " +  topk(elements(id2).label.toInt).mkString("\n"))
                 topk(elements(id2).label.toInt) += neighDist(id1, id2) -> id2
+                //println("dist: " + neighDist(id1, id2))
+                //println("topk: " +  topk(elements(id2).label.toInt).mkString("\n"))
                 
                 // Count matches in output feature
                 if(clshit){          
@@ -186,14 +192,6 @@ object MainMLlibTest {
                          joint(it.next, last) += 1
                   //collisioned += last
                 }
-                
-                
-                // Generate combinations and update joint collisions counter
-                /*(0 until collisioned.size).map{f1 => 
-                  (f1 + 1 until collisioned.size).map{ f2 =>
-                    joint(collisioned(f1), collisioned(f2)) += 1
-                  }         
-                }*/
                 total.add(1L) // use to compute likelihoods (denom)
               }
             } else {
@@ -203,15 +201,17 @@ object MainMLlibTest {
         // RELIEF-F computations        
         e1.features.foreachActive{ case (index, value) =>
           val weight = (0 until nClasses).map { cls => 
-            val sum = topk(cls).map{ case(_, id2) =>
+            val sum = topk(cls).map{ case(dist, id2) =>
                if(norminal){
                  if (value != elements(id2).features(index)) 1 else 0
                }  else {
-                 math.pow(value - elements(id2).features(index), 2) 
+                 math.abs(value - elements(id2).features(index))
                }
             }.sum
-            if(cls != elements(id1).label){
-              sum.toFloat * bpriorClass.value.getOrElse(cls, 0.0f) / topk(cls).size 
+            if(cls != e1.label){
+              val factor = bpriorClass.value.getOrElse(cls, 0.0f) / 
+                ((1 - bpriorClass.value.getOrElse(e1.label, 0.0f)) * topk(cls).size)
+              sum.toFloat * factor 
             } else {
               -sum.toFloat / topk(cls).size 
             }
@@ -226,11 +226,11 @@ object MainMLlibTest {
       reliefWeights.iterator      
     }.reduceByKey(_ + _).cache
     
+    println("Relief ranking: " + reliefRanking.sortBy(-_._2).collect.mkString("\n"))
     val avgRelief = reliefRanking.values.mean()
     val stdRelief = reliefRanking.values.stdev()
     val normalizedRelief = reliefRanking.mapValues(score => ((score - avgRelief) / stdRelief).toFloat).collect()
     
-  
     val marginal = accMarginal.value.mapValues(_.toFloat) 
     marginal :/= total.value.toFloat 
     val joint = accJoint.value.toDenseMatrix.mapValues(_.toFloat)
