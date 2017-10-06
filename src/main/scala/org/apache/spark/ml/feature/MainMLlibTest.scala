@@ -169,7 +169,7 @@ object MainMLlibTest {
                        marginal(index) += 1
                        val it = collisioned.iterator
                        while(it.hasNext)
-                         joint(collisioned(it.next), collisioned(index)) += 1
+                         joint(it.next, index) += 1
                        collisioned += index
                        //collisioned += index
                    }
@@ -183,7 +183,7 @@ object MainMLlibTest {
                   marginal(last) += 1
                   val it = collisioned.iterator
                   while(it.hasNext)
-                         joint(collisioned(it.next), collisioned(last)) += 1
+                         joint(it.next, last) += 1
                   //collisioned += last
                 }
                 
@@ -332,6 +332,7 @@ object MainMLlibTest {
       inputCol = inputLabel
       df
     }
+    reducedData.show()
     println("Reduced schema: " + reducedData.schema)
     val splits = MLUtils.kFold(reducedData.rdd, 10, seed)
     val sql = df.sqlContext
@@ -387,7 +388,12 @@ object MainMLlibTest {
 
       val model = estimator.fit(trainingDataset)
       trainingDataset.unpersist()
-      evaluator.evaluate(model.transform(validationDataset))
+      val acc = evaluator.evaluate(model.transform(validationDataset))
+      if(!acc.isNaN()){
+        acc
+      } else {
+        0.0d
+      }
     }.sum
     sum.toFloat / splits.size
   }
