@@ -7,22 +7,22 @@ import org.apache.spark.util.AccumulatorV2
 /**
  * @author sramirez
  */
-class VectorAccumulator(val rows: Int) extends AccumulatorV2[Vector[Long], Vector[Long]] {
+class VectorAccumulator(val rows: Int) extends AccumulatorV2[Vector[Double], Vector[Double]] {
   
-  def this(m: Vector[Long]) = {
+  def this(m: Vector[Double]) = {
     this(m.size)
     this.accVector = m.copy
   }
 
-  private var accVector: Vector[Long] = Vector.zeros[Long](rows)
+  private var accVector: Vector[Double] = Vector.zeros[Double](rows)
   private var zero: Boolean = true
 
   def reset(): Unit = {
-    accVector = Vector.zeros[Long](rows)
+    accVector = Vector.zeros[Double](rows)
     zero = true
   }
 
-  def add(v: Vector[Long]): Unit = {
+  def add(v: Vector[Double]): Unit = {
     if(isZero) 
       zero = false
     accVector += v
@@ -30,9 +30,9 @@ class VectorAccumulator(val rows: Int) extends AccumulatorV2[Vector[Long], Vecto
   
   def isZero(): Boolean = zero
   
-  def merge(other: AccumulatorV2[Vector[Long], Vector[Long]]): Unit = accVector += other.value
+  def merge(other: AccumulatorV2[Vector[Double], Vector[Double]]): Unit = accVector += other.value
   
-  def value: Vector[Long] = accVector
+  def value: Vector[Double] = accVector
   
-  def copy(): AccumulatorV2[Vector[Long], Vector[Long]] = new VectorAccumulator(accVector)
+  def copy(): AccumulatorV2[Vector[Double], Vector[Double]] = new VectorAccumulator(accVector)
 }

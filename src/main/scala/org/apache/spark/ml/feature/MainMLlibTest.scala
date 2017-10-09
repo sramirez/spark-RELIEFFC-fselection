@@ -50,9 +50,11 @@ object MainMLlibTest {
   var inputLabel: String = "features"
   var firstHeader: Boolean = false
   var k: Int = 5
-  var categorical: Boolean = false
+  var continuous: Boolean = false
   var nselect: Int = 10
   var seed = 12345678L
+  
+  var mrmr: Boolean = false
   
   
   // Case class for criteria/feature
@@ -66,7 +68,7 @@ object MainMLlibTest {
     val sc = new SparkContext(conf)
     sqlContext = new SQLContext(sc)
 
-    println("Usage: MLlibTest --train-file=\"hdfs://blabla\" --nselect=10 --npart=1 --categorical=false --k=5 --ntop=10 --disc=false --padded=2 --class-last=true --header=false")
+    println("Usage: MLlibTest --train-file=\"hdfs://blabla\" --nselect=10 --npart=1 --continuous=false --k=5 --ntop=10 --discretize=false --padded=2 --class-last=true --header=false")
         
     // Create a table of parameters (parsing)
     val params = args.map{ arg =>
@@ -86,7 +88,10 @@ object MainMLlibTest {
     firstHeader = params.getOrElse("header", "false").toBoolean
     k = params.getOrElse("k", "10").toInt
     nselect = params.getOrElse("nselect", "10").toInt
-    categorical = params.getOrElse("categorical", "false").toBoolean
+    continuous = params.getOrElse("continuous", "true").toBoolean
+    mrmr = params.getOrElse("mrmr", "false").toBoolean
+    
+    
     
     
     println("Params used: " +  params.mkString("\n"))
@@ -118,9 +123,8 @@ object MainMLlibTest {
     println("Schema: " + df.schema)
     
     //val elements = rdd.collect
-    val nf = rdd.first.features.size + 1
+    val nf = rdd.first.features.size
     val nelems = rdd.count()
-    //val belems = rdd.context.broadcast(elements)
     
     val accMarginal = new VectorAccumulator(nf)
     // Then, register it into spark context:
@@ -131,28 +135,32 @@ object MainMLlibTest {
     println("# instances: " + rdd.count)
     println("# partitions: " + rdd.partitions.size)
     val knn = k
-    val norminal = categorical
+    val cont = continuous
     val priorClass = rdd.map(_.label).countByValue().mapValues(_ / nelems.toFloat).map(identity)
     val bpriorClass = rdd.context.broadcast(priorClass)
     val nClasses = priorClass.size
     
     val reliefRanking = rdd.mapPartitions { it =>
         
-        val reliefWeights = breeze.linalg.DenseVector.fill(nf - 1){0.0f}
-        val marginal = breeze.linalg.DenseVector.zeros[Long](nf)
-        val last = marginal.size - 1
-        val joint = breeze.linalg.DenseMatrix.zeros[Long](nf, nf)
+        val reliefWeights = breeze.linalg.DenseVector.fill(nf){0.0f}
+        val marginal = breeze.linalg.DenseVector.zeros[Double](nf)
+        val joint = breeze.linalg.DenseMatrix.zeros[Double](nf, nf)
         
         val elements = it.toArray
         val neighDist = breeze.linalg.DenseMatrix.fill(
               elements.size, elements.size){Double.MinValue}
-        // BPQ replace always the lowest, so we have to change the order (importante dejar el -1)
-        val ordering = Ordering[Double].on[(Double, Int)](-_._1) 
         
+        // BPQ replace always the lowest, so we have to change the order (very important not to modify -1)
+        val ordering = Ordering[Double].on[(Double, Int)](-_._1) 
+        val r = new scala.util.Random
+        val condition = if(cont) (d: Double) => d > 0.5 + r.nextFloat() * 0.5 else (d: Double) => d == 0
+        val vote = if(cont) (d: Double) => d else (d: Double) => Double.MinPositiveValue
+          
         (0 until elements.size).foreach{ id1 =>
           val e1 = elements(id1)
           var topk = Array.fill[BoundedPriorityQueue[(Double, Int)]](nClasses)(
                 new BoundedPriorityQueue[(Double, Int)](knn)(ordering))
+                
           (0 until elements.size).foreach{ id2 => 
             
             if(neighDist(id2, id1) < 0){
@@ -160,34 +168,22 @@ object MainMLlibTest {
                 // Compute collisions and distance
                 val e2 = elements(id2)              
                 var collisioned = Queue[Int]()
-                val clshit = e1.label == e2.label
                 neighDist(id1, id2) = 0 // Init the distance counter
                 e1.features.foreachActive{ (index, value) =>
-                   val dist = math.pow(value - e2.features(index), 2)
-                   if(dist == 0){
-                       marginal(index) += 1
-                       val it = collisioned.iterator
-                       while(it.hasNext)
-                         joint(it.next, index) += 1
-                       collisioned += index
-                       //collisioned += index
+                   val norm = math.abs(value - e2.features(index))
+                   // We annotate the collision. 
+                   // The closer the distance, the greater the annotating likelihood.
+                   if(condition(norm)){
+                      marginal(index) += vote(norm)
+                      val it = collisioned.iterator
+                      while(it.hasNext)
+                         joint(it.next, index) += vote(norm)
+                      collisioned += index
                    }
-                   neighDist(id1, id2) += dist
+                   neighDist(id1, id2) += math.pow(norm, 2)
                 }
                 neighDist(id1, id2) = math.sqrt(neighDist(id1, id2))  
-                //println("topk: " +  topk(elements(id2).label.toInt).mkString("\n"))
                 topk(elements(id2).label.toInt) += neighDist(id1, id2) -> id2
-                //println("dist: " + neighDist(id1, id2))
-                //println("topk: " +  topk(elements(id2).label.toInt).mkString("\n"))
-                
-                // Count matches in output feature
-                if(clshit){          
-                  marginal(last) += 1
-                  val it = collisioned.iterator
-                  while(it.hasNext)
-                         joint(it.next, last) += 1
-                  //collisioned += last
-                }
                 total.add(1L) // use to compute likelihoods (denom)
               }
             } else {
@@ -221,16 +217,14 @@ object MainMLlibTest {
     val stdRelief = reliefRanking.values.stdev()
     val normalizedRelief = reliefRanking.mapValues(score => ((score - avgRelief) / stdRelief).toFloat).collect()
     
-    val marginal = accMarginal.value.mapValues(_.toFloat) 
-    marginal :/= total.value.toFloat 
-    val joint = accJoint.value.toDenseMatrix.mapValues(_.toFloat)
-    joint :/= total.value.toFloat   
+    val marginal = accMarginal.value.mapValues(_ / (total.value * Double.MinPositiveValue))  
+    val joint = accJoint.value.toDenseMatrix.mapValues(_ / (total.value * Double.MinPositiveValue))
     
     // Compute mutual information using collisions with and without class
     val redundancyMatrix = breeze.linalg.DenseMatrix.zeros[Float](nf, nf)
     joint.activeIterator.foreach { case((i1,i2), value) =>
-      if(i1 < i2 && i1 != nf - 1 && i2 != nf - 1){
-        val red = value * log2(value / (marginal(i1) * marginal(i2))).toFloat              
+      if(i1 < i2){
+        val red = (value * log2(value / (marginal(i1) * marginal(i2)))).toFloat              
         redundancyMatrix(i1, i2) = red
         redundancyMatrix(i2, i1) = red        
       }        
@@ -391,10 +385,10 @@ object MainMLlibTest {
   def selectFeatures(nfeatures: Int, reliefRanking: Array[(Int, Float)],
       redundancyMatrix: breeze.linalg.DenseMatrix[Float]) = {
     
-    val attAlive = Array.fill(nfeatures - 1)(true)
+    val attAlive = Array.fill(nfeatures)(true)
     // Initialize all (except the class) criteria with the relevance values
     val criterionFactory = new InfoThCriterionFactory("mrmr")
-    val pool = Array.fill[InfoThCriterion](nfeatures - 1) {
+    val pool = Array.fill[InfoThCriterion](nfeatures) {
       val crit = criterionFactory.getCriterion.init(Float.NegativeInfinity)
       crit.setValid(false)
     }
@@ -491,8 +485,15 @@ object MainMLlibTest {
       
       val model = discretizer.fit(processedDF)
       processedDF = model.transform(processedDF)
-      processedDF.show(100)
-      categorical = true
+      processedDF.show()
+      continuous = false
+    } else if(continuous) {
+      val scaler = new MinMaxScaler()
+        .setInputCol(inputLabel)
+        .setOutputCol("norm-" + inputLabel)
+
+      inputLabel = "norm-" + inputLabel
+      processedDF = scaler.fit(processedDF).transform(processedDF)
     }
     processedDF
   }
@@ -524,185 +525,5 @@ object MainMLlibTest {
     selector.fit(df)
   }
   
-  def compareRedundancies(model: InfoThSelectorModel, 
-      redundancyMatrix: breeze.linalg.DenseMatrix[Float],
-      order: Int) {
-        
-    model.selectedFeatures.foreach{ sf => 
-        model.redMap.get(sf) match {
-          case Some(redByFeature) =>
-            // InfoTheoretic
-            val avgInfo = redByFeature.map(_._2._1).sum / redByFeature.length
-            val devInfo = Math.sqrt((redByFeature.map(_._2._1).map(_ - avgInfo).map(t => t*t).sum) / redByFeature.length).toFloat
-            
-            val normRedInfo = redByFeature.map{ case(id, (score, _)) => id -> ((score - avgInfo) / devInfo)}
-            val rankingInfoTh = normRedInfo
-              .sortBy(_._2 * order)  
-              .slice(0, nTop)
-              .zipWithIndex
-              .map{case ((id, score), rank) =>
-                id -> (rank, score)  
-              }
-              
-            
-            // Collision version
-            val rawRedColl = redundancyMatrix(::,sf).toArray
-              .dropRight(1)
-              .zipWithIndex
-              .filter(_._2 != sf)
-            
-            val avgColl = rawRedColl.map(_._1).sum / rawRedColl.length
-            val devColl = Math.sqrt((rawRedColl.map(_._1).map( _ - avgColl).map(t => t*t).sum) / rawRedColl.length).toFloat
-            
-            val normRedColl = rawRedColl.map{ case(score, id) => (score - avgColl) / devColl.toFloat -> id} 
-            val rankingCollisions = normRedColl
-              .sortBy(_._1 * order)
-              .zipWithIndex
-              .map{case ((score, id), rank) =>
-                id -> (rank, score)  
-              }
-              
-             // Compute average distance between rankings
-            val mapRankingCollisions = rankingCollisions.toMap
-            var sumDifRankings = 0.0f
-            rankingInfoTh.foreach{ case(f, (rank1, _)) =>
-              val (rank2, _) = mapRankingCollisions.getOrElse(f, -1 -> -1.0f)
-              if(rank2 > 0) {
-                sumDifRankings += math.abs(rank1 - rank2)
-              }
-            }
-              
-            // Compute average distance between scores
-            var sumDifScores = 0.0f
-            rankingInfoTh.foreach{ case(f, (_, score1)) =>
-              val (_, score2) = mapRankingCollisions.getOrElse(f, -1 -> Float.NaN)
-              if(score2 != Float.NaN) {
-                sumDifScores += math.abs(score1 - score2)
-              }
-            }
-              
-            // Compute final statistics
-            println("Feature target: " + sf)            
-            println("Avg. ranking distance by feature: " + sumDifRankings / rankingInfoTh.size)
-            println("Avg. score distance by feature: " + sumDifScores / rankingInfoTh.size)
-            println("# distinct features: " + rankingInfoTh.map(_._1).toSet.diff(
-                rankingCollisions.slice(0, nTop).map(_._1).toSet))    
-                
-            println("InfoTh Values: " + rankingInfoTh.mkString("\n"))
-            println("Collision Values: " + rankingCollisions.mkString("\n"))
-           
-          case None => println("That didn't work.")
-        }
-    }
-  }
-  
-  def doComparison() {
-    val rawDF = TestHelper.readCSVData(sqlContext, pathFile, firstHeader)
-    val df = preProcess(rawDF).select(clsLabel, inputLabel)
-    val allVectorsDense = true
- 
-    df.show
-    println("df: " + df.first().toString())
-    
-    val origRDD = initRDD(df, allVectorsDense)
-    val rdd = origRDD.map {
-      case Row(label: Double, features: Vector) =>
-        LabeledPoint(label, features)
-    }.repartition(nPartitions).cache //zipwithUniqueIndexs
-    println("rdd: " + rdd.first().toString())
-    
-    //Dataframe version
-    val inputData = sqlContext.createDataFrame(origRDD, df.schema).cache()
-    println("Schema: " + df.schema)
-    
-    //val elements = rdd.collect
-    val nf = rdd.first.features.size + 1
-    //val belems = rdd.context.broadcast(elements)
-    
-    val accMarginal = new VectorAccumulator(nf)
-    // Then, register it into spark context:
-    rdd.context.register(accMarginal, "marginal")
-    val accJoint = new MatrixAccumulator(nf, nf)
-    rdd.context.register(accJoint, "joint")
-    val accConditional = new MatrixAccumulator(nf, nf)
-    rdd.context.register(accConditional, "conditional")
-    val total = rdd.context.longAccumulator("total")
-    println("# instances: " + rdd.count)
-    println("# partitions: " + rdd.partitions.size)
-    
-    rdd.foreachPartition { it =>
-        
-        val marginal = breeze.linalg.DenseVector.zeros[Long](nf)
-        val last = marginal.size - 1
-        val joint = breeze.linalg.DenseMatrix.zeros[Long](nf, nf)
-        val condjoint = breeze.linalg.DenseMatrix.zeros[Long](nf, nf)
-        //val others = belems.value
-        val elements = it.toArray
-        (0 until elements.size).map{ id1 =>
-        //while(it.hasNext){
-          //val (e1, id1) = it.next
-          val e1 = elements(id1)
-          //others.foreach{ case (e2, id2) => 
-          (id1 + 1 until elements.size).map{ id2 => 
-            val e2 = elements(id2)
-            //if(id1 > id2) {
-            if(true) {
-                var set = new TreeSet[Int]()
-                val clshit = e1.label == e2.label
-                e1.features.foreachActive{ (index, value) =>
-                   if(e1.features(index) == e2.features(index)){
-                       marginal(index) += 1
-                       set += index
-                   }            
-                }
-                
-                // Count matches in output feature
-                if(clshit){          
-                  marginal(last) += 1
-                  set += last
-                }
-                
-                // Generate combinations and update joint collisions counter
-                val arr = set.toArray
-                (0 until arr.size).map{f1 => 
-                  (f1 + 1 until arr.size).map{ f2 =>
-                    joint(arr(f1), arr(f2)) += 1
-                    if(clshit)
-                      condjoint(arr(f1), arr(f2)) += 1
-                  }         
-                }
-              total.add(1L)
-            }            
-        }
-      }
-        
-      accMarginal.add(marginal)
-      accJoint.add(joint)
-      accConditional.add(condjoint)
-    }
-  
-    val marginal = accMarginal.value.mapValues(_.toFloat) 
-    marginal :/= total.value.toFloat 
-    val joint = accJoint.value.toDenseMatrix.mapValues(_.toFloat)
-    joint :/= total.value.toFloat 
-    val conditional = accConditional.value.toDenseMatrix.mapValues(_.toFloat)
-    conditional :/= total.value.toFloat    
-    
-    // Compute mutual information using collisions with and without class
-    val redundancyMatrix = breeze.linalg.DenseMatrix.zeros[Float](nf, nf)
-    joint.activeIterator.foreach { case((i1,i2), value) =>
-      if(i1 < i2 && i1 != nf - 1 && i2 != nf - 1){
-        val red = value * log2(value / (marginal(i1) * marginal(i2))).toFloat        
-        
-        redundancyMatrix(i1, i2) = red
-        redundancyMatrix(i2, i1) = red        
-      }
-        
-    }
-    
-    val model = fitMRMR(inputData)
-    compareRedundancies(model, redundancyMatrix, order) 
-  }
-  
-  def log2(x: Float) = { math.log(x) / math.log(2) }
+  def log2(x: Double) = { math.log(x) / math.log(2) }
 }
