@@ -391,6 +391,7 @@ object MainMLlibTest {
   def selectFeatures(nfeatures: Int, reliefRanking: Array[(Int, Float)],
       redundancyMatrix: breeze.linalg.DenseMatrix[Float]) = {
     
+    val attAlive = Array.fill(nfeatures - 1)(true)
     // Initialize all (except the class) criteria with the relevance values
     val criterionFactory = new InfoThCriterionFactory("mrmr")
     val pool = Array.fill[InfoThCriterion](nfeatures - 1) {
@@ -412,11 +413,12 @@ object MainMLlibTest {
     // Iterative process for redundancy and conditional redundancy
     while (selected.size < nselect && moreFeat) {
 
+      attAlive(selected.head.feat) = false
       val redundancies = redundancyMatrix(::, selected.head.feat)
               .toArray
               .dropRight(1)
               .zipWithIndex
-              .filter(_._2 != selected.head.feat)
+              .filter(c => attAlive(c._2))
 
       // Update criteria with the new redundancy values      
       redundancies.par.foreach({
