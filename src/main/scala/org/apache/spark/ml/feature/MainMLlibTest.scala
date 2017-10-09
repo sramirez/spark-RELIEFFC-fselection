@@ -163,11 +163,7 @@ object MainMLlibTest {
                 val clshit = e1.label == e2.label
                 neighDist(id1, id2) = 0 // Init the distance counter
                 e1.features.foreachActive{ (index, value) =>
-                   val dist = if(norminal){
-                     if (value != e2.features(index)) 1 else 0
-                   }  else {
-                     math.pow(value - e2.features(index), 2) 
-                   }
+                   val dist = math.pow(value - e2.features(index), 2)
                    if(dist == 0){
                        marginal(index) += 1
                        val it = collisioned.iterator
@@ -200,14 +196,8 @@ object MainMLlibTest {
         }
         // RELIEF-F computations        
         e1.features.foreachActive{ case (index, value) =>
-          val weight = (0 until nClasses).map { cls => 
-            val sum = topk(cls).map{ case(dist, id2) =>
-               if(norminal){
-                 if (value != elements(id2).features(index)) 1 else 0
-               }  else {
-                 math.abs(value - elements(id2).features(index))
-               }
-            }.sum
+          val weight = (0 until nClasses).map { cls =>  
+            val sum = topk(cls).map{ case(dist, id2) => math.abs(value - elements(id2).features(index)) }.sum
             if(cls != e1.label){
               val factor = bpriorClass.value.getOrElse(cls, 0.0f) / 
                 ((1 - bpriorClass.value.getOrElse(e1.label, 0.0f)) * topk(cls).size)

@@ -19,11 +19,11 @@ object DiscreteDataGenerator extends Serializable {
       noiseOnRelevant: Double,
       redundantNoises: Seq[Double],
       nRandomFeatures: Int,
+      outputPath: String = "src/test/resources/random.data",
+      nLabels: Int = 2,
       maxBins: Int = 15,
       maxDepth: Int = 20,
-      nLabels: Int = 2,
-      seed: Long = System.currentTimeMillis(),
-      outputPath: String = "src/test/resources/random.data") = {
+      seed: Long = System.currentTimeMillis()) = {
 
     val generator =
       new RandomDecisionTreeGenerator(nRelevantFeatures, maxBins, maxDepth, nLabels, seed)
