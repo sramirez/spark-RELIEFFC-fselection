@@ -214,7 +214,7 @@ final class InfoThSelectorModel private[ml] (
     val featureAttributes: Array[Attribute] = if (origAttrGroup.attributes.nonEmpty) {
       origAttrGroup.attributes.get.zipWithIndex.filter(x => selector.contains(x._2)).map(_._1)
     } else {
-      Array.fill[Attribute](selector.size)(NominalAttribute.defaultAttr)
+      Array.fill[Attribute](selector.size)(NumericAttribute.defaultAttr)
     }
     val newAttributeGroup = new AttributeGroup($(outputCol), featureAttributes)
     newAttributeGroup.toStructField()

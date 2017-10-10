@@ -7,7 +7,7 @@ import org.apache.spark.util.AccumulatorV2
 /**
  * @author sramirez
  */
-class VectorAccumulator(val rows: Int) extends AccumulatorV2[Vector[Double], Vector[Double]] {
+class DoubleVectorAccumulator(val rows: Int) extends AccumulatorV2[Vector[Double], Vector[Double]] {
   
   def this(m: Vector[Double]) = {
     this(m.size)
@@ -34,5 +34,5 @@ class VectorAccumulator(val rows: Int) extends AccumulatorV2[Vector[Double], Vec
   
   def value: Vector[Double] = accVector
   
-  def copy(): AccumulatorV2[Vector[Double], Vector[Double]] = new VectorAccumulator(accVector)
+  def copy(): AccumulatorV2[Vector[Double], Vector[Double]] = new DoubleVectorAccumulator(accVector)
 }

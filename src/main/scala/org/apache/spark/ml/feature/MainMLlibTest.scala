@@ -30,6 +30,10 @@ import org.apache.spark.ml.classification.DecisionTreeClassifier
 import org.apache.spark.ml.classification.MultilayerPerceptronClassifier
 import org.apache.spark.ml.classification.LogisticRegression
 import scala.collection.mutable.Queue
+import org.apache.spark.ml.attribute.AttributeGroup
+import org.apache.spark.ml.attribute.NominalAttribute
+import org.apache.spark.ml.attribute.Attribute
+import org.apache.spark.ml.util.MetadataUtils
 
 
 /**
@@ -53,6 +57,7 @@ object MainMLlibTest {
   var continuous: Boolean = false
   var nselect: Int = 10
   var seed = 12345678L
+  var thresholdDistance = 0.75
   
   var mrmr: Boolean = false
   
@@ -90,6 +95,7 @@ object MainMLlibTest {
     nselect = params.getOrElse("nselect", "10").toInt
     continuous = params.getOrElse("continuous", "true").toBoolean
     mrmr = params.getOrElse("mrmr", "false").toBoolean
+    thresholdDistance = params.getOrElse("thdistance", "0.75").toFloat
     
     
     
@@ -105,9 +111,7 @@ object MainMLlibTest {
     val rawDF = TestHelper.readCSVData(sqlContext, pathFile, firstHeader)
     val df = preProcess(rawDF).select(clsLabel, inputLabel)
     val allVectorsDense = true
- 
     df.show
-    println("df: " + df.first().toString())
     
     val origRDD = initRDD(df, allVectorsDense)
     val rdd = origRDD.map {
@@ -115,27 +119,27 @@ object MainMLlibTest {
         LabeledPoint(label, features)
     }.repartition(nPartitions).cache //zipwithUniqueIndexs
     
-    println("Discretized: " + rdd.map(_.features).take(100).mkString("\n"))
-    println("rdd: " + rdd.first().toString())   
-    
     //Dataframe version
     val inputData = sqlContext.createDataFrame(origRDD, df.schema).cache()
-    println("Schema: " + df.schema)
+    println("Schema: " + inputData.schema)
     
     //val elements = rdd.collect
     val nf = rdd.first.features.size
     val nelems = rdd.count()
     
-    val accMarginal = new VectorAccumulator(nf)
+    val accMarginal = new DoubleVectorAccumulator(nf)
     // Then, register it into spark context:
     rdd.context.register(accMarginal, "marginal")
     val accJoint = new MatrixAccumulator(nf, nf)
     rdd.context.register(accJoint, "joint")
+    val totalByFeat = new LongVectorAccumulator(nf)
+    rdd.context.register(totalByFeat, "totalByFeat")
     val total = rdd.context.longAccumulator("total")
     println("# instances: " + rdd.count)
     println("# partitions: " + rdd.partitions.size)
     val knn = k
     val cont = continuous
+    val thDistance = thresholdDistance 
     val priorClass = rdd.map(_.label).countByValue().mapValues(_ / nelems.toFloat).map(identity)
     val bpriorClass = rdd.context.broadcast(priorClass)
     val nClasses = priorClass.size
@@ -145,6 +149,7 @@ object MainMLlibTest {
         val reliefWeights = breeze.linalg.DenseVector.fill(nf){0.0f}
         val marginal = breeze.linalg.DenseVector.zeros[Double](nf)
         val joint = breeze.linalg.DenseMatrix.zeros[Double](nf, nf)
+        val ltotal = breeze.linalg.DenseVector.zeros[Long](nf)
         
         val elements = it.toArray
         val neighDist = breeze.linalg.DenseMatrix.fill(
@@ -153,7 +158,8 @@ object MainMLlibTest {
         // BPQ replace always the lowest, so we have to change the order (very important not to modify -1)
         val ordering = Ordering[Double].on[(Double, Int)](-_._1) 
         val r = new scala.util.Random
-        val condition = if(cont) (d: Double) => d > 0.5 + r.nextFloat() * 0.5 else (d: Double) => d == 0
+        // Data are assumed to be scaled to have 0 mean, and 1 std
+        val redundancyProb = if(cont) (d: Double) => 1 - math.min(6.0, d) / 6.0 else (d: Double) => d
         val vote = if(cont) (d: Double) => d else (d: Double) => Double.MinPositiveValue
           
         (0 until elements.size).foreach{ id1 =>
@@ -168,23 +174,34 @@ object MainMLlibTest {
                 // Compute collisions and distance
                 val e2 = elements(id2)              
                 var collisioned = Queue[Int]()
-                neighDist(id1, id2) = 0 // Init the distance counter
+                val randomNumber = r.nextFloat()
+                val condition = if(cont) (d: Double) => d > thDistance + randomNumber * thDistance else 
+                   (d: Double) => d == 0
+                neighDist(id1, id2) = 0 // Initialize the distance counter
+                val pcounter = Array.fill(nf)(0.0d)
                 e1.features.foreachActive{ (index, value) =>
-                   val norm = math.abs(value - e2.features(index))
+                   val absdiff = math.abs(value - e2.features(index))
+                   val d = redundancyProb(absdiff)  
                    // We annotate the collision. 
                    // The closer the distance, the greater the annotating likelihood.
-                   if(condition(norm)){
-                      marginal(index) += vote(norm)
+                   if(condition(d)){
+                      marginal(index) += vote(d)
+                      if(cont) pcounter(index) = vote(d)
                       val it = collisioned.iterator
-                      while(it.hasNext)
-                         joint(it.next, index) += vote(norm)
+                      while(it.hasNext){
+                        val i2 = it.next
+                        val jointVote = if(cont) (pcounter(i2) + pcounter(index)) / 2 else vote(d)
+                        joint(i2, index) += jointVote
+                      }
+                         
                       collisioned += index
+                      ltotal(index) += 1L // use to compute likelihoods (denom)
                    }
-                   neighDist(id1, id2) += math.pow(norm, 2)
+                   neighDist(id1, id2) += math.pow(absdiff, 2)
                 }
                 neighDist(id1, id2) = math.sqrt(neighDist(id1, id2))  
                 topk(elements(id2).label.toInt) += neighDist(id1, id2) -> id2
-                total.add(1L) // use to compute likelihoods (denom)
+                total.add(1L)
               }
             } else {
               topk(elements(id2).label.toInt) += neighDist(id2, id1) -> id2              
@@ -208,22 +225,30 @@ object MainMLlibTest {
       // update accumulated matrices  
       accMarginal.add(marginal)
       accJoint.add(joint)
+      totalByFeat.add(ltotal)
       
       reliefWeights.iterator      
     }.reduceByKey(_ + _).cache
     
     println("Relief ranking: " + reliefRanking.sortBy(-_._2).collect.mkString("\n"))
+    println("Number of collisions by feature: " + totalByFeat.value.toArray.mkString(","))
     val avgRelief = reliefRanking.values.mean()
     val stdRelief = reliefRanking.values.stdev()
     val normalizedRelief = reliefRanking.mapValues(score => ((score - avgRelief) / stdRelief).toFloat).collect()
+    val denom = if(cont) (i: Int) => total.value.longValue() else (i: Int) => total.value.longValue()
+    val factor = if(cont) 1 else Double.MinPositiveValue
     
-    val marginal = accMarginal.value.mapValues(_ / (total.value * Double.MinPositiveValue))  
-    val joint = accJoint.value.toDenseMatrix.mapValues(_ / (total.value * Double.MinPositiveValue))
+    val marginal = accMarginal.value.toDenseVector.mapPairs{ case(index, value) =>
+      value /  (denom(index) * factor)
+    }  
+    val joint = accJoint.value.toDenseMatrix.mapPairs{ case(index, value) => 
+      value / (denom(index._1) * factor)
+    }  
     
     // Compute mutual information using collisions with and without class
     val redundancyMatrix = breeze.linalg.DenseMatrix.zeros[Float](nf, nf)
     joint.activeIterator.foreach { case((i1,i2), value) =>
-      if(i1 < i2){
+      if(i1 < i2) {
         val red = (value * log2(value / (marginal(i1) * marginal(i2)))).toFloat              
         redundancyMatrix(i1, i2) = red
         redundancyMatrix(i2, i1) = red        
@@ -249,21 +274,29 @@ object MainMLlibTest {
     // Print best features according to the RELIEF-F measure
     val outRC = reliefColl.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
     val outR = relief.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
-    val mRMRmodel = fitMRMR(inputData)
-    
-    println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
     println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
     println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
     
-    val mrmrAcc = kCVPerformance(inputData, mRMRmodel, "nb")
-    val relCAcc = kCVPerformance(inputData, reliefCollModel, "nb")   
-    val relAcc = kCVPerformance(inputData, reliefModel, "nb")   
-    val acc = kCVPerformance(inputData, null, "nb")   
-    val mrmrAccDT = kCVPerformance(inputData, mRMRmodel, "dt")
+    var mrmrAcc = 0.0f; var mrmrAccDT = 0.0f; var mrmrAccLR = 0.0f; var selectedMRMR = new String();
+    if(mrmr){      
+      val mRMRmodel = fitMRMR(inputData)
+      println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
+      mrmrAcc = kCVPerformance(inputData, mRMRmodel, "nb")
+      mrmrAccDT = kCVPerformance(inputData, mRMRmodel, "dt")
+      mrmrAccLR = kCVPerformance(inputData, mRMRmodel, "lr")
+      selectedMRMR = mRMRmodel.selectedFeatures.map(_ + 1).mkString(",")
+    }
+      
+    var relCAcc = 0.0f; var relAcc = 0.0f; var acc = 0.0f;
+    if(!cont){
+      // NB does not accept negative values.
+      relCAcc = kCVPerformance(inputData, reliefCollModel, "nb")   
+      relAcc = kCVPerformance(inputData, reliefModel, "nb")   
+      acc = kCVPerformance(inputData, null, "nb")   
+    }
     val relCAccDT = kCVPerformance(inputData, reliefCollModel, "dt")   
     val relAccDT = kCVPerformance(inputData, reliefModel, "dt")   
     val accDT = kCVPerformance(inputData, null, "dt")   
-    val mrmrAccLR = kCVPerformance(inputData, mRMRmodel, "lr")
     val relCAccLR = kCVPerformance(inputData, reliefCollModel, "lr") 
     val relAccLR = kCVPerformance(inputData, reliefModel, "lr") 
     val accLR = kCVPerformance(inputData, null, "lr")
@@ -281,7 +314,7 @@ object MainMLlibTest {
     println("Train accuracy for Relief (LR) = " + relAccLR)
     println("Baseline train accuracy (LR) = " + accLR)
     
-    println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
+    println("\n*** Selected by mRMR: " + selectedMRMR)
     println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
     println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
   }
@@ -316,15 +349,14 @@ object MainMLlibTest {
       inputCol = inputLabel
       df
     }
-    reducedData.show()
     println("Reduced schema: " + reducedData.schema)
     val splits = MLUtils.kFold(reducedData.rdd, 10, seed)
     val sql = df.sqlContext
-        
+    
     val estimator = if(classifier == "nb") {
        new NaiveBayes()
         .setFeaturesCol(inputCol)
-        .setLabelCol(clsLabel)    
+        .setLabelCol(labelCol)    
      
     } else if(classifier == "dt") {
       val labelIndexer = new StringIndexer()
@@ -363,6 +395,9 @@ object MainMLlibTest {
         .setLabelCol(labelCol)
         .setPredictionCol("prediction")
         .setMetricName("accuracy")
+        
+        
+    reducedData.col(reducedData.columns.head)
         
     //K-folding operation starting
     //for each fold you have multiple models created cfm. the paramgrid
@@ -485,12 +520,13 @@ object MainMLlibTest {
       
       val model = discretizer.fit(processedDF)
       processedDF = model.transform(processedDF)
-      processedDF.show()
       continuous = false
     } else if(continuous) {
-      val scaler = new MinMaxScaler()
+      val scaler = new StandardScaler()
         .setInputCol(inputLabel)
         .setOutputCol("norm-" + inputLabel)
+        .setWithStd(true)
+        .setWithMean(true)
 
       inputLabel = "norm-" + inputLabel
       processedDF = scaler.fit(processedDF).transform(processedDF)
