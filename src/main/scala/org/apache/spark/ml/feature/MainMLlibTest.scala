@@ -141,6 +141,7 @@ object MainMLlibTest {
     val priorClass = rdd.map(_.label).countByValue().mapValues(_ / nelems.toFloat).map(identity)
     val bpriorClass = rdd.context.broadcast(priorClass)
     val nClasses = priorClass.size
+    val lseed = this.seed
     
     val reliefRanking = rdd.mapPartitions { it =>
         
@@ -155,7 +156,7 @@ object MainMLlibTest {
         
         // BPQ replace always the lowest, so we have to change the order (very important not to modify -1)
         val ordering = Ordering[Double].on[(Double, Int)](-_._1) 
-        val r = new scala.util.Random
+        val r = new scala.util.Random(lseed)
         // Data are assumed to be scaled to have 0 mean, and 1 std
         val vote = if(cont) (d: Double) => 1 - math.min(6.0, d) / 6.0 else (d: Double) => Double.MinPositiveValue
           
