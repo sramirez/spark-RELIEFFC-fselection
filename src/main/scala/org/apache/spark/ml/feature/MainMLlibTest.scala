@@ -132,14 +132,12 @@ object MainMLlibTest {
     rdd.context.register(accMarginal, "marginal")
     val accJoint = new MatrixAccumulator(nf, nf)
     rdd.context.register(accJoint, "joint")
-    val totalByFeat = new LongVectorAccumulator(nf)
-    rdd.context.register(totalByFeat, "totalByFeat")
     val total = rdd.context.longAccumulator("total")
     println("# instances: " + rdd.count)
     println("# partitions: " + rdd.partitions.size)
     val knn = k
     val cont = continuous
-    val thDistance = thresholdDistance 
+    val lowerTh = thresholdDistance 
     val priorClass = rdd.map(_.label).countByValue().mapValues(_ / nelems.toFloat).map(identity)
     val bpriorClass = rdd.context.broadcast(priorClass)
     val nClasses = priorClass.size
@@ -159,45 +157,40 @@ object MainMLlibTest {
         val ordering = Ordering[Double].on[(Double, Int)](-_._1) 
         val r = new scala.util.Random
         // Data are assumed to be scaled to have 0 mean, and 1 std
-        val redundancyProb = if(cont) (d: Double) => 1 - math.min(6.0, d) / 6.0 else (d: Double) => d
-        val vote = if(cont) (d: Double) => d else (d: Double) => Double.MinPositiveValue
+        val vote = if(cont) (d: Double) => 1 - math.min(6.0, d) / 6.0 else (d: Double) => Double.MinPositiveValue
           
         (0 until elements.size).foreach{ id1 =>
           val e1 = elements(id1)
           var topk = Array.fill[BoundedPriorityQueue[(Double, Int)]](nClasses)(
                 new BoundedPriorityQueue[(Double, Int)](knn)(ordering))
-                
+          val threshold = 6 * (1 - (lowerTh + r.nextFloat() * lowerTh))
+          val condition = if(cont) (d: Double) => d <= threshold else 
+                   (d: Double) => d == 0
+                   
           (0 until elements.size).foreach{ id2 => 
-            
             if(neighDist(id2, id1) < 0){
               if(id1 != id2) {
                 // Compute collisions and distance
                 val e2 = elements(id2)              
                 var collisioned = Queue[Int]()
-                val randomNumber = r.nextFloat()
-                val condition = if(cont) (d: Double) => d > thDistance + randomNumber * thDistance else 
-                   (d: Double) => d == 0
                 neighDist(id1, id2) = 0 // Initialize the distance counter
                 val pcounter = Array.fill(nf)(0.0d)
                 e1.features.foreachActive{ (index, value) =>
-                   val absdiff = math.abs(value - e2.features(index))
-                   val d = redundancyProb(absdiff)  
-                   // We annotate the collision. 
+                   val fdistance = math.abs(value - e2.features(index))
                    // The closer the distance, the greater the annotating likelihood.
-                   if(condition(d)){
-                      marginal(index) += vote(d)
-                      if(cont) pcounter(index) = vote(d)
+                   if(condition(fdistance)){
+                      val contribution = vote(fdistance)
+                      marginal(index) += contribution
+                      if(cont) pcounter(index) = contribution
                       val it = collisioned.iterator
                       while(it.hasNext){
                         val i2 = it.next
-                        val jointVote = if(cont) (pcounter(i2) + pcounter(index)) / 2 else vote(d)
+                        val jointVote = if(cont) (pcounter(i2) + pcounter(index)) / 2 else contribution
                         joint(i2, index) += jointVote
-                      }
-                         
+                      }                         
                       collisioned += index
-                      ltotal(index) += 1L // use to compute likelihoods (denom)
                    }
-                   neighDist(id1, id2) += math.pow(absdiff, 2)
+                   neighDist(id1, id2) += math.pow(fdistance, 2)
                 }
                 neighDist(id1, id2) = math.sqrt(neighDist(id1, id2))  
                 topk(elements(id2).label.toInt) += neighDist(id1, id2) -> id2
@@ -225,13 +218,12 @@ object MainMLlibTest {
       // update accumulated matrices  
       accMarginal.add(marginal)
       accJoint.add(joint)
-      totalByFeat.add(ltotal)
       
       reliefWeights.iterator      
     }.reduceByKey(_ + _).cache
     
     println("Relief ranking: " + reliefRanking.sortBy(-_._2).collect.mkString("\n"))
-    println("Number of collisions by feature: " + totalByFeat.value.toArray.mkString(","))
+    println("Number of collisions by feature: " + total.value)
     val avgRelief = reliefRanking.values.mean()
     val stdRelief = reliefRanking.values.stdev()
     val normalizedRelief = reliefRanking.mapValues(score => ((score - avgRelief) / stdRelief).toFloat).collect()
