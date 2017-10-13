@@ -207,8 +207,8 @@ object MainMLlibTest {
             val sum = topk(cls).map{ case(dist, id2) => math.abs(value - elements(id2).features(index)) }.sum
             if(cls != e1.label){
               val factor = bpriorClass.value.getOrElse(cls, 0.0f) / 
-                ((1 - bpriorClass.value.getOrElse(e1.label, 0.0f)) * topk(cls).size)
-              sum.toFloat * factor 
+                (1 - bpriorClass.value.getOrElse(e1.label, 0.0f)) 
+              sum.toFloat * factor / topk(cls).size
             } else {
               -sum.toFloat / topk(cls).size 
             }
@@ -225,9 +225,9 @@ object MainMLlibTest {
     
     println("Relief ranking: " + reliefRanking.sortBy(-_._2).collect.mkString("\n"))
     println("Number of collisions by feature: " + total.value)
-    val avgRelief = reliefRanking.values.mean()
-    val stdRelief = reliefRanking.values.stdev()
-    val normalizedRelief = reliefRanking.mapValues(score => ((score - avgRelief) / stdRelief).toFloat).collect()
+    val maxRelief = reliefRanking.values.max()
+    val minRelief = reliefRanking.values.min()
+    val normalizedRelief = reliefRanking.mapValues(score => ((score - minRelief) / (maxRelief - minRelief)).toFloat).collect()
     val denom = if(cont) (i: Int) => total.value.longValue() else (i: Int) => total.value.longValue()
     val factor = if(cont) 1 else Double.MinPositiveValue
     
@@ -250,7 +250,10 @@ object MainMLlibTest {
     
     import breeze.stats._ 
     val stats = meanAndVariance(redundancyMatrix)
-    val normRedundancyMatrix = redundancyMatrix.mapValues{ value => ((value - stats.mean) / stats.stdDev).toFloat }    
+    val maxRed = breeze.linalg.max(redundancyMatrix)
+    val minRed = breeze.linalg.min(redundancyMatrix)
+    
+    val normRedundancyMatrix = redundancyMatrix.mapValues{ value => ((value - minRed) / (maxRed - minRed)).toFloat }    
     val (reliefColl, relief) = selectFeatures(nf, normalizedRelief, normRedundancyMatrix)    
     val reliefCollModel = new InfoThSelectorModel("", new org.apache.spark.mllib.feature.InfoThSelectorModel(
         selectedFeatures = reliefColl.map { case F(feat, rel) => feat }.sorted.toArray))
