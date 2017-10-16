@@ -88,7 +88,7 @@ object MainMLlibTest {
     nPartitions = params.getOrElse("npart", "1").toInt
     nTop = params.getOrElse("ntop", "10").toInt
     discretize = params.getOrElse("disc", "false").toBoolean
-    padded = params.getOrElse("padded", "2").toInt
+    padded = params.getOrElse("padded", "0").toInt
     classLastIndex = params.getOrElse("class-last", "false").toBoolean
     firstHeader = params.getOrElse("header", "false").toBoolean
     k = params.getOrElse("k", "10").toInt
@@ -97,13 +97,9 @@ object MainMLlibTest {
     mrmr = params.getOrElse("mrmr", "false").toBoolean
     thresholdDistance = params.getOrElse("thdistance", "0.75").toFloat
     
-    
-    
-    
     println("Params used: " +  params.mkString("\n"))
     
     doRELIEFComparison()
-    //doComparison()
   }
   
   
@@ -123,7 +119,6 @@ object MainMLlibTest {
     val inputData = sqlContext.createDataFrame(origRDD, df.schema).cache()
     println("Schema: " + inputData.schema)
     
-    //val elements = rdd.collect
     val nf = rdd.first.features.size
     val nelems = rdd.count()
     
@@ -225,17 +220,17 @@ object MainMLlibTest {
     
     println("Relief ranking: " + reliefRanking.sortBy(-_._2).collect.mkString("\n"))
     println("Number of collisions by feature: " + total.value)
+    
     val maxRelief = reliefRanking.values.max()
     val minRelief = reliefRanking.values.min()
-    val normalizedRelief = reliefRanking.mapValues(score => ((score - minRelief) / (maxRelief - minRelief)).toFloat).collect()
-    val denom = if(cont) (i: Int) => total.value.longValue() else (i: Int) => total.value.longValue()
-    val factor = if(cont) 1 else Double.MinPositiveValue
+    val normalizedRelief = reliefRanking.mapValues(score => ((score - minRelief) / (maxRelief - minRelief)).toFloat).collect
     
+    val factor = if(cont) 1.0 else Double.MinPositiveValue
     val marginal = accMarginal.value.toDenseVector.mapPairs{ case(index, value) =>
-      value /  (denom(index) * factor)
+      value /  (total.value * factor)
     }  
     val joint = accJoint.value.toDenseMatrix.mapPairs{ case(index, value) => 
-      value / (denom(index._1) * factor)
+      value / (total.value.longValue() * factor)
     }  
     
     // Compute mutual information using collisions with and without class
@@ -248,8 +243,6 @@ object MainMLlibTest {
       }        
     }
     
-    import breeze.stats._ 
-    val stats = meanAndVariance(redundancyMatrix)
     val maxRed = breeze.linalg.max(redundancyMatrix)
     val minRed = breeze.linalg.min(redundancyMatrix)
     
@@ -313,26 +306,6 @@ object MainMLlibTest {
     println("\n*** Selected by mRMR: " + selectedMRMR)
     println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
     println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
-  }
-  
-  def evaluateClsPerformance(df: DataFrame, fsmodel: InfoThSelectorModel) = {
-    val reducedData = fsmodel.transform(df)
-    println("schema: " + reducedData.schema)
-    // Train a NaiveBayes model.
-    val model = new NaiveBayes()
-      .setFeaturesCol("selectedFeatures")
-      .setLabelCol(clsLabel)
-      
-    // Select example rows to display.
-    val predictions = model.fit(reducedData).transform(reducedData)
-    predictions.show()
-    
-    // Select (prediction, true label) and compute test error
-    val evaluator = new MulticlassClassificationEvaluator()
-      .setLabelCol(clsLabel)
-      .setPredictionCol("prediction")
-      .setMetricName("accuracy")
-    evaluator.evaluate(predictions)
   }
   
   def kCVPerformance(df: DataFrame, fsmodel: InfoThSelectorModel, classifier: String) = {
@@ -441,7 +414,6 @@ object MainMLlibTest {
       attAlive(selected.head.feat) = false
       val redundancies = redundancyMatrix(::, selected.head.feat)
               .toArray
-              .dropRight(1)
               .zipWithIndex
               .filter(c => attAlive(c._2))
 
@@ -462,7 +434,7 @@ object MainMLlibTest {
       }
     }
     val reliefNoColl = reliefRanking.sortBy(r => (-r._2, r._1))
-        .slice(0, nselect).map{ case(id, score) => F(id,score)}.toSeq
+        .slice(0, nselect).map{ case(id, score) => F(id, score)}.toSeq
     (selected.reverse, reliefNoColl)  
   }
   
