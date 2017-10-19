@@ -122,16 +122,15 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
     x.zip(y).map{ case(v1, v2) => 
       var dist = 0.0d
       var i = 0
-      import scala.util.control.Breaks._
-      breakable { while(i < v1.size){
-        val offset = math.pow(v1(i), v2(i))
+      while(i < v1.size && dist < Double.PositiveInfinity){
+        val offset = math.abs(v1(i) - v2(i))
         if(offset > 1 || dist > n) {
           dist = Double.PositiveInfinity
-          break
         } else {
-          dist += offset
-        } 
-      } }
+          dist += math.pow(offset, 2)
+        }
+        i += 1
+      }
       dist
     }.min
   }
@@ -185,7 +184,8 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
     
     // Index query objects and compute the table that indicates where are located its neighbors
     val idxModelQuery = modelQuery.withColumn("UniqueID", monotonically_increasing_id).cache()
-    val neighbors: RDD[(Long, Map[Short, Iterable[Int]])] = approxNearestNeighbors(modelDataset, idxModelQuery, k * label2Num.size, labelCol, step)
+    val neighbors: RDD[(Long, Map[Short, Iterable[Int]])] = approxNN(modelDataset, idxModelQuery, 
+        k * label2Num.size, labelCol, step)
     val bNeighborsTable = sc.broadcast(neighbors.collectAsMap())
     val bFullQuery = sc.broadcast(idxModelQuery.select("UniqueID", $(inputCol), labelCol).collect())
       
@@ -226,7 +226,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
                    val fdistance = math.abs(value - ninput(index))
                    //// RELIEF Computations
                    if(nlabel != qlabel){
-                     val labelIndex =  if(nlabel != qlabel) labelConversion.get(nlabel).get else labelConversion.size
+                     val labelIndex = if(nlabel != qlabel) labelConversion.get(nlabel.toFloat).get else labelConversion.size
                      reliefWeights(index)(labelIndex) += fdistance.toFloat
                      classCounter(labelIndex) += + 1  
                    }
@@ -274,7 +274,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
   }
   
     // TODO: Fix the MultiProbe NN Search in SPARK-18454
-  private def approxNearestNeighbors(
+  private def approxNN(
       modelDataset: Dataset[_],
       idxModelQuery: Dataset[_],
       k: Int,
@@ -323,9 +323,9 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
       key: Vector,
       numNearestNeighbors: Int,
       probeMode: String,
-      distCol: String,
+      hashDistCol: String,
       relativeError: Double,
-      step: Int = 3): Dataset[_] = {
+      step: Int = 2): (Long, Dataset[_]) = {
     require(numNearestNeighbors > 0, "The number of nearest neighbors cannot be less than 1")
     // Get Hash Value of the key
     val keyHash = hashFunction(key)
@@ -335,7 +335,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
         dataset.toDF()
       }
 
-    val modelSubset = probeMode match {
+    val (filtered, modelSubset) = probeMode match {
       
       case "single" => 
         def sameBucket(x: Seq[Vector], y: Seq[Vector]): Boolean = {
@@ -346,38 +346,36 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
         val sameBucketWithKeyUDF = udf((x: Seq[Vector]) =>
           sameBucket(x, keyHash), DataTypes.BooleanType)
 
-        modelDataset.filter(sameBucketWithKeyUDF(col($(outputCol))))
+        val filteredData = modelDataset.filter(sameBucketWithKeyUDF(col($(outputCol))))
+        (filteredData.count, filteredData)
       case "multi" =>
         // In the origin dataset, find the hash value that is closest to the key
-        // Limit the use of hashDist since it's controversial
         val distanceFunction = if(step < 1) (x: Seq[Vector]) => hashDistance(x, keyHash) else 
           (x: Seq[Vector]) => hashThresholdedDistance(x, keyHash, step)
         val hashDistUDF = udf(distanceFunction, DataTypes.DoubleType)
-        val hashDistCol = hashDistUDF(col($(outputCol)))
+        val hashDistColumn = hashDistUDF(col($(outputCol)))
   
         // Compute threshold to get exact k elements.
-        val quantile = numNearestNeighbors.toDouble / modelDataset.count()
-        val modelDatasetWithDist = modelDataset.withColumn(distCol, hashDistCol)
-        val hashThreshold = modelDatasetWithDist.stat
-          .approxQuantile(distCol, Array(quantile), relativeError)
+        val modelDatasetWithDist = modelDataset.withColumn(hashDistCol, hashDistColumn)
+        val filteredData = modelDatasetWithDist.filter(col(hashDistCol) < Float.PositiveInfinity)
   
         // Filter the dataset where the hash value is less than the threshold.
-        modelDataset.filter(hashDistCol <= hashThreshold(0))        
+        (filteredData.count, filteredData) 
     }
 
     // Get the top k nearest neighbor by their distance to the key
     val keyDistUDF = udf((x: Vector) => keyDistance(x, key), DataTypes.DoubleType)
-    val modelSubsetWithDistCol = modelSubset.withColumn(distCol, keyDistUDF(col($(inputCol))))
-    modelSubsetWithDistCol.sort(distCol).limit(numNearestNeighbors)
+    val modelSubsetWithDistCol = modelSubset.withColumn(hashDistCol, keyDistUDF(col($(inputCol))))
+    (filtered, modelSubsetWithDistCol.sort(hashDistCol).limit(numNearestNeighbors))
   }
 
   private[feature] def approxNearestNeighbors(
       dataset: Dataset[_],
       key: Vector,
       numNearestNeighbors: Int,
-      modeProbe: String,
-      distCol: String): Dataset[_] = {
-    approxNearestNeighbors(dataset, key, numNearestNeighbors, modeProbe, distCol, 0.05)
+      probeMode: String,
+      distCol: String): (Long, Dataset[_]) = {
+    approxNearestNeighbors(dataset, key, numNearestNeighbors, probeMode, distCol, 0.05)
   }
 
   /**
@@ -399,8 +397,8 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
       dataset: Dataset[_],
       key: Vector,
       numNearestNeighbors: Int,
-      distCol: String): Dataset[_] = {
-    approxNearestNeighbors(dataset, key, numNearestNeighbors, "single", distCol)
+      distCol: String): (Long, Dataset[_]) = {
+    approxNearestNeighbors(dataset, key, numNearestNeighbors, "multi", distCol)
   }
 
   /**
@@ -409,8 +407,8 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
   def approxNearestNeighbors(
       dataset: Dataset[_],
       key: Vector,
-      numNearestNeighbors: Int): Dataset[_] = {
-    approxNearestNeighbors(dataset, key, numNearestNeighbors, "single", "distCol")
+      numNearestNeighbors: Int): (Long, Dataset[_]) = {
+    approxNearestNeighbors(dataset, key, numNearestNeighbors, "multi", "distCol")
   }
 
   /**
@@ -552,11 +550,13 @@ private[ml] abstract class LSH[T <: LSHModel[T]]
    * @param inputDim The dimension of the input dataset
    * @return A new LSHModel instance without any params
    */
-  protected[this] def createRawLSHModel(inputDim: Int): T
+  protected[this] def createRawLSHModel(projectedDim: Int, originalDim: Int): T
 
   override def fit(dataset: Dataset[_]): T = {
     transformSchema(dataset.schema, logging = true)
-    val model = createRawLSHModel($(signatureSize)).setParent(this)
+    val inputDim = dataset.select(col($(inputCol))).head().get(0).asInstanceOf[Vector].size
+    
+    val model = createRawLSHModel($(signatureSize), inputDim).setParent(this)
     copyValues(model)
   }
 }

@@ -58,6 +58,11 @@ object MainMLlibTest {
   var nselect: Int = 10
   var seed = 12345678L
   var thresholdDistance = 0.75
+  var numHashTables = 30
+  var bucketWidth = 4
+  var signatureSize = 10
+  var mode = "test-lsh"
+  var percTest = 0.2f
   
   var mrmr: Boolean = false
   
@@ -96,10 +101,19 @@ object MainMLlibTest {
     continuous = params.getOrElse("continuous", "true").toBoolean
     mrmr = params.getOrElse("mrmr", "false").toBoolean
     thresholdDistance = params.getOrElse("thdistance", "0.75").toFloat
+    numHashTables = params.getOrElse("numHashTables", "30").toInt
+    bucketWidth = params.getOrElse("bucketWidth", "4").toInt
+    signatureSize = params.getOrElse("signatureSize", "10").toInt
+    percTest = params.getOrElse("percTest", "0.2f").toFloat
+    
     
     println("Params used: " +  params.mkString("\n"))
     
+    if(mode == "test-lsh"){
+      this.testLSHPerformance()
+    } else {
     doRELIEFComparison()
+    }
   }
   
   
@@ -528,6 +542,45 @@ object MainMLlibTest {
         
     selector.fit(df)
   }
+  
+  def testLSHPerformance() {
+    val rawDF = TestHelper.readCSVData(sqlContext, pathFile, firstHeader)
+    val df = preProcess(rawDF).select(clsLabel, inputLabel).cache
+    val allVectorsDense = true
+    df.show
+    
+    val nFeat = df.select(inputLabel).head().getAs[Vector](0).size
+    val nelems = df.count()
+    
+    val brp = new BucketedRandomProjectionLSH()
+      .setNumHashTables(numHashTables)
+      .setInputCol(inputLabel)
+      .setOutputCol("hashCol")
+      .setBucketLength(bucketWidth)
+      .setSignatureSize(signatureSize)
+      .setSeed(seed)
+    val keys = df.select(inputLabel).sample(false, percTest, seed).collect()
+    
+    var sumer = 0.0
+    var sump = 0.0
+    var sumr = 0.0
+    var red = 0L
+    var sumtime = 0.0
+    var sumMax = 0.0
+    keys.foreach { case Row(key: Vector) =>  
+      val (errorRatio, precision, recall, redundancy, time, maxdist) = LSHTest.calculateApproxNearestNeighbors(
+          brp, df, key, k, "multi", "distCol") 
+      sump += precision; sumr += recall; red += redundancy; sumtime += time; sumMax += maxdist; sumer += errorRatio
+    }
+    println("Average error Ratio: " + sumer / keys.size)
+    println("Average precision: " + sump / keys.size)
+    println("Average recall: " + sumr / keys.size)
+    println("Average selectivity: " + red / keys.size)
+    println("Average runtime (in s): " + sumtime / keys.size)
+    println("Number of hash tables: " + numHashTables)
+    println("Average maximum distance: " + sumMax / keys.size)
+  }
+  
   
   def log2(x: Double) = { math.log(x) / math.log(2) }
 }
