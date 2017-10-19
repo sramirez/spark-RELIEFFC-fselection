@@ -567,10 +567,13 @@ object MainMLlibTest {
     var red = 0L
     var sumtime = 0.0
     var sumMax = 0.0
+    var maxd = 0.0
     keys.foreach { case Row(key: Vector) =>  
       val (errorRatio, precision, recall, redundancy, time, maxdist) = LSHTest.calculateApproxNearestNeighbors(
           brp, df, key, k, "multi", "distCol") 
       sump += precision; sumr += recall; red += redundancy; sumtime += time; sumMax += maxdist; sumer += errorRatio
+      if(maxdist > maxd) 
+        maxd = maxdist
     }
     println("Average error Ratio: " + sumer / keys.size)
     println("Average precision: " + sump / keys.size)
@@ -579,6 +582,8 @@ object MainMLlibTest {
     println("Average runtime (in s): " + sumtime / keys.size)
     println("Number of hash tables: " + numHashTables)
     println("Average maximum distance: " + sumMax / keys.size)
+    println("Total Maximum distance: " + maxd)
+    
   }
   
   

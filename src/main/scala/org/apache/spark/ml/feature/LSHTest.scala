@@ -120,7 +120,7 @@ private[ml] object LSHTest {
     val expected = modelDatasetWithDist.sort("realDist").limit(k).cache
     val nexpected = expected.count()
     val farthestNeighbor = expected.sort(desc("realDist")).select(model.getInputCol).head().getAs[Vector](0)
-    val maxHashDist = model.hashDistance(model.hashFunction(farthestNeighbor), model.hashFunction(key))
+    val maxHashDist = math.sqrt(model.hashDistance(model.hashFunction(farthestNeighbor), model.hashFunction(key)))
     
     // Compute query time
     val s = System.nanoTime
@@ -131,7 +131,7 @@ private[ml] object LSHTest {
     // Compute precision and recall
     val error = actual.select(distCol).collect().zip(expected.select("realDist")collect()).map{ 
       case(Row(actualDist: Double), Row(expectedDist: Double)) =>
-        (actualDist + 1) / (expectedDist + 1) - 1
+        (actualDist + 1) / (expectedDist + 1)
     }.sum
     
     val correctCount = expected.join(actual, model.getInputCol).count().toDouble
