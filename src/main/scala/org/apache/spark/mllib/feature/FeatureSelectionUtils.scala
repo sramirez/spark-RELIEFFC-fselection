@@ -36,7 +36,7 @@ object FeatureSelectionUtils {
    * @param features vector
    * @param filterIndices indices of features to filter, must be ordered asc
    */
-  private[feature] def compress(features: Vector, filterIndices: Array[Int]): Vector = {
+  private[spark] def compress(features: Vector, filterIndices: Array[Int]): Vector = {
     features match {
       case v: SparseVector =>
         val newSize = filterIndices.length
