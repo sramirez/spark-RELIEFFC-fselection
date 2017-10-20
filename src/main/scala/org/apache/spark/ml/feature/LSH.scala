@@ -29,6 +29,10 @@ import org.apache.spark.sql.types._
 import org.apache.spark.ml.linalg.Vectors
 import scala.collection.mutable.Queue
 import org.apache.spark.rdd.RDD
+import org.apache.spark.broadcast.Broadcast
+//import scala.collection.Map
+
+import scala.collection.immutable.Map
 
 /**
  * Params for [[LSH]].
@@ -145,176 +149,6 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
     validateAndTransformSchema(schema)
   }
 
-  // TODO: Fix the MultiProbe NN Search in SPARK-18454
-  private[feature] def selectFeatures(
-      dataset: Dataset[_],
-      query: Dataset[_],
-      k: Int,
-      probeMode: String,
-      distCol: String,
-      relativeError: Double,
-      labelCol: String,
-      step: Int = 3,
-      continuous: Boolean = true,
-      seed: Long = 12345678L) = {
-    require(k > 0, "The number of nearest neighbors cannot be less than 1")
-    require(step > 0, "The number of steps in stepwise searching cannot be less than 1")
-    
-    // Get Hash Value of the key
-    val modelDataset: DataFrame = if (!dataset.columns.contains($(outputCol))) {
-        transform(dataset)
-      } else {
-        dataset.toDF()
-      }
-    val modelQuery: DataFrame = if (!query.columns.contains($(outputCol))) {
-        transform(query)
-      } else {
-        dataset.toDF()
-      }  
-    
-    // Get some basic information about the dataset
-    val nFeat = modelDataset.select($(inputCol)).head().getAs[Vector](0).size
-    val nelems = modelDataset.count()
-    val priorClass = modelDataset.select(labelCol).rdd.map{ 
-      case Row(label: Double) => label.toFloat }.countByValue().mapValues(_ / nelems).map(identity)
-    val label2Num = priorClass.zipWithIndex.map{case (k, v) => k._1 -> v.toShort}
-    val sc = modelDataset.sparkSession.sparkContext
-    val bLabel2Num = sc.broadcast(label2Num) 
-    val bpriorClass = sc.broadcast(priorClass)
-    
-    // Index query objects and compute the table that indicates where are located its neighbors
-    val idxModelQuery = modelQuery.withColumn("UniqueID", monotonically_increasing_id).cache()
-    val neighbors: RDD[(Long, Map[Short, Iterable[Int]])] = approxNN(modelDataset, idxModelQuery, 
-        k * label2Num.size, labelCol, step)
-    val bNeighborsTable = sc.broadcast(neighbors.collectAsMap())
-    val bFullQuery = sc.broadcast(idxModelQuery.select("UniqueID", $(inputCol), labelCol).collect())
-      
-    val accMarginal = new DoubleVectorAccumulator(nFeat); sc.register(accMarginal, "marginal")
-    val accJoint = new MatrixAccumulator(nFeat, nFeat);  sc.register(accJoint, "joint")
-    val neighborClassCount = new LongVectorAccumulator(label2Num.size + 1); sc.register(neighborClassCount, "classCount")
-    val cont = continuous
-    val lowerTh = 0.75f
-
-    val nClasses = priorClass.size
-    
-    val rawWeights = modelDataset.select($(inputCol), labelCol).rdd.mapPartitionsWithIndex { case(pindex, it) =>
-      val localExamples = it.toArray
-      val query = bFullQuery.value
-      val table = bNeighborsTable.value
-      val labelConversion = bLabel2Num.value
-      // last position is reserved to negative weights from central instances.
-      val reliefWeights = Array.fill(nFeat, labelConversion.size + 1)(0.0f) 
-      val marginal = breeze.linalg.DenseVector.zeros[Double](nFeat)
-      val joint = breeze.linalg.DenseMatrix.zeros[Double](nFeat, nFeat)
-      val classCounter = breeze.linalg.DenseVector.zeros[Long](labelConversion.size + 1)
-      val r = new scala.util.Random(seed)
-      // Data are assumed to be scaled to have 0 mean, and 1 std
-      val vote = if(cont) (d: Double) => 1 - math.min(6.0, d) / 6.0 else (d: Double) => Double.MinPositiveValue
-      
-      query.map{ case Row(qid: Long, qinput: Vector, qlabel: Double) =>
-          val condition = if(cont) (d: Double) => d <= 6 * (1 - (lowerTh + r.nextFloat() * lowerTh)) else 
-                   (d: Double) => d == 0
-          
-          table.get(qid) match {
-            case Some(localMap) =>
-              val values = localMap.getOrElse(pindex.toShort, Iterable.empty)
-              values.map{ lidx =>
-                val Row(ninput: Vector, nlabel: Double) = localExamples(lidx)
-                var collisioned = Queue[Int]()
-                val pcounter = Array.fill(nFeat)(0.0d)
-                qinput.foreachActive{ (index, value) =>
-                   val fdistance = math.abs(value - ninput(index))
-                   //// RELIEF Computations
-                   if(nlabel != qlabel){
-                     val labelIndex = if(nlabel != qlabel) labelConversion.get(nlabel.toFloat).get else labelConversion.size
-                     reliefWeights(index)(labelIndex) += fdistance.toFloat
-                     classCounter(labelIndex) += + 1  
-                   }
-                   //// Collision-based computations
-                   // The closer the distance, the greater the annotating likelihood.
-                   if(condition(fdistance)){
-                      val contribution = vote(fdistance)
-                      marginal(index) += contribution
-                      if(cont) pcounter(index) = contribution
-                      val it = collisioned.iterator
-                      while(it.hasNext){
-                        val i2 = it.next
-                        val jointVote = if(cont) (pcounter(i2) + pcounter(index)) / 2 else contribution
-                        joint(i2, index) += jointVote
-                      }                         
-                      collisioned += index
-                   }
-                }
-              }
-            case None =>
-              System.err.println("Instance does not found in the table")
-          }
-          // update accumulated matrices  
-          accMarginal.add(marginal)
-          accJoint.add(joint) 
-          neighborClassCount.add(classCounter)
-      }
-      reliefWeights.zipWithIndex.map(_.swap).toIterator
-    }.reduceByKey(_ ++ _).cache
-    
-    val clsC = neighborClassCount.value
-    
-    val finalWeights = rawWeights.mapValues { weights => 
-      val labelConversion = bLabel2Num.value
-      val priorProp = bpriorClass.value
-      
-      var sum = labelConversion.map{ case(label, index) =>
-        priorProp.get(label).get * weights(index) / clsC(index)
-      }.sum  
-      sum -= weights(weights.size) / clsC(weights.size)
-      sum / nelems
-    }
-    
-    finalWeights
-  }
-  
-    // TODO: Fix the MultiProbe NN Search in SPARK-18454
-  private def approxNN(
-      modelDataset: Dataset[_],
-      idxModelQuery: Dataset[_],
-      k: Int,
-      labelCol: String,
-      step: Int = 3) = {
-    
-    
-    case class Localization(part: Short, index: Int)
-    val sc = modelDataset.sparkSession.sparkContext        
-    val bModelQuery = sc.broadcast(idxModelQuery.select("UniqueID", $(outputCol)).collect())
-    val hashThDistance = (h1: Array[Vector], h2: Array[Vector]) => this.hashThresholdedDistance(h1, h2, step)
-    
-    val neighbors = modelDataset.select($(inputCol), labelCol, $(outputCol)).rdd.mapPartitionsWithIndex { 
-        case (pindex, it) => 
-        
-          val ordering = Ordering[Float].on[(Float, Localization)](-_._1)   
-          val query = bModelQuery.value
-          val lneighbors = query.map { case Row(id: Long, _) => 
-            id -> new BoundedPriorityQueue[(Float, Localization)](k)(ordering)
-          }   
-      
-          var i = 0
-          while(it.hasNext) {
-            val Row(input: Vector, label: Double, hashNeig: Array[Vector]) = it.next
-            (0 until query.size).foreach { j => 
-               query(j) match{
-                 case Row(_, hash: Array[Vector]) => 
-                    val dist = hashThDistance(hash, hashNeig).toFloat
-                    if(dist < Float.PositiveInfinity)
-                      lneighbors(j)._2 += dist -> Localization(pindex.toShort, i)
-               }
-              
-            }
-            i += 1              
-          }            
-          lneighbors.toIterator
-      }.reduceByKey(_ ++= _).mapValues(
-          _.map(l => Localization.unapply(l._2).get).groupBy(_._1).mapValues(_.map(_._2)))
-    neighbors
-  }
   
   
   // TODO: Fix the MultiProbe NN Search in SPARK-18454
@@ -509,6 +343,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
       threshold: Double): Dataset[_] = {
     approxSimilarityJoin(datasetA, datasetB, threshold, "distCol")
   }
+  
 }
 
 /**
@@ -559,4 +394,5 @@ private[ml] abstract class LSH[T <: LSHModel[T]]
     val model = createRawLSHModel($(signatureSize), inputDim).setParent(this)
     copyValues(model)
   }
+  
 }
