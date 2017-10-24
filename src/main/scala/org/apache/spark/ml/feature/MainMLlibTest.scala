@@ -57,12 +57,16 @@ object MainMLlibTest {
   var continuous: Boolean = false
   var nselect: Int = 10
   var seed = 12345678L
-  var thresholdDistance = 0.75
+  var lowerFeatThreshold = 0.5
   var numHashTables = 30
   var bucketWidth = 4
   var signatureSize = 10
   var mode = "test-lsh"
   var percTest = 0.2f
+  var batchSize = 0.25f
+  var estimationRatio = 1.0f
+  var queryStep = 2
+  
   
   var mrmr: Boolean = false
   
@@ -100,19 +104,24 @@ object MainMLlibTest {
     nselect = params.getOrElse("nselect", "10").toInt
     continuous = params.getOrElse("continuous", "true").toBoolean
     mrmr = params.getOrElse("mrmr", "false").toBoolean
-    thresholdDistance = params.getOrElse("thdistance", "0.75").toFloat
+    lowerFeatThreshold = params.getOrElse("lowerFeatThreshold", "0.5").toFloat
     numHashTables = params.getOrElse("numHashTables", "30").toInt
     bucketWidth = params.getOrElse("bucketWidth", "4").toInt
     signatureSize = params.getOrElse("signatureSize", "10").toInt
     percTest = params.getOrElse("percTest", "0.2f").toFloat
-    
+    batchSize = params.getOrElse("batchSize", "0.25f").toFloat
+    estimationRatio = params.getOrElse("estimationRatio", "1.0f").toFloat
+    queryStep = params.getOrElse("queryStep", "2").toInt    
+    mode = params.getOrElse("mode", "final")
     
     println("Params used: " +  params.mkString("\n"))
     
     if(mode == "test-lsh"){
       this.testLSHPerformance()
+    } else if(mode == "final") {
+      testFinalSelector()
     } else {
-    doRELIEFComparison()
+      doRELIEFComparison()
     }
   }
   
@@ -136,7 +145,7 @@ object MainMLlibTest {
     val nf = rdd.first.features.size
     val nelems = rdd.count()
     
-    val accMarginal = new DoubleVectorAccumulator(nf)
+    val accMarginal = new VectorAccumulator(nf)
     // Then, register it into spark context:
     rdd.context.register(accMarginal, "marginal")
     val accJoint = new MatrixAccumulator(nf, nf)
@@ -146,7 +155,7 @@ object MainMLlibTest {
     println("# partitions: " + rdd.partitions.size)
     val knn = k
     val cont = continuous
-    val lowerTh = thresholdDistance 
+    val lowerTh = 0.8f 
     val priorClass = rdd.map(_.label).countByValue().mapValues(_ / nelems.toFloat).map(identity)
     val bpriorClass = rdd.context.broadcast(priorClass)
     val nClasses = priorClass.size
@@ -584,6 +593,33 @@ object MainMLlibTest {
     println("Average maximum distance: " + sumMax / keys.size)
     println("Total Maximum distance: " + maxd)
     
+  }
+  
+  def testFinalSelector() {
+    val rawDF = TestHelper.readCSVData(sqlContext, pathFile, firstHeader)
+    val df = preProcess(rawDF).select(clsLabel, inputLabel).cache
+    val allVectorsDense = true
+    df.show
+    
+    val nFeat = df.select(inputLabel).head().getAs[Vector](0).size
+    val nelems = df.count()
+    
+    val selector = new ReliefFRSelector()
+      .setInputCol(inputLabel)
+      .setOutputCol("selectedFeatures")
+      .setLabelCol(clsLabel)
+      .setNumHashTables(numHashTables)
+      .setBucketLength(bucketWidth)
+      .setSignatureSize(signatureSize)
+      .setSeed(seed)
+      .setEstimationRatio(estimationRatio)
+      .setBatchSize(batchSize)
+      .setLowerFeatureThreshold(lowerFeatThreshold)
+      .setQueryStep(queryStep)
+    
+    val model = selector.fit(df)  
+    val reduced = model.transform(df)
+    reduced.count()
   }
   
   

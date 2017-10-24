@@ -15,10 +15,9 @@
  * limitations under the License.
  */
 
-package org.apache.spark.mllib.feature
+package org.apache.spark.ml.feature
 
 import scala.collection.mutable.ArrayBuilder
-
 import org.apache.spark.annotation.Experimental
 import org.apache.spark.mllib.linalg._
 
