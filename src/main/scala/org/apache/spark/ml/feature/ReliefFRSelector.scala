@@ -38,15 +38,18 @@ import scala.collection.mutable.Queue
 import breeze.linalg.DenseMatrix
 import breeze.linalg.Axis
 import org.apache.spark.mllib.feature.FeatureSelectionUtils
+import breeze.linalg.DenseVector
+import org.apache.spark.mllib.util.MLUtils
 
 /**
- * Params for [[ReliefClsSelector]] and [[ReliefClsSelectorModel]].
+ * Params for [[ReliefFRSelector]] and [[ReliefFRSelectorModel]].
  */
-private[feature] trait ReliefClsSelectorParams extends Params
+private[feature] trait ReliefFRSelectorParams extends Params
     with HasInputCol with HasOutputCol with HasLabelCol with HasSeed {
 
   /**
-   * Information Theoretic criterion used to rank the features. The default value is the criterion mRMR.
+   * Relief with redundancy removal criterion used to rank the features.
+   * Relief relies on LSH to perform efficient nearest neighbor searches.
    *
    * @group param
    */
@@ -64,7 +67,6 @@ private[feature] trait ReliefClsSelectorParams extends Params
 
   /** @group getParam */
   final def getNumHashTables: Int = $(numHashTables)
-
   setDefault(numHashTables -> 1)
   
     /**
@@ -80,7 +82,6 @@ private[feature] trait ReliefClsSelectorParams extends Params
 
   /** @group getParam */
   final def getSignatureSize: Int = $(signatureSize)
-
   setDefault(signatureSize -> 16)
   
   /**
@@ -97,8 +98,7 @@ private[feature] trait ReliefClsSelectorParams extends Params
     ParamValidators.gt(0))
 
   /** @group getParam */
-  final def getBucketLength: Double = $(bucketLength)
-  
+  final def getBucketLength: Double = $(bucketLength)  
   setDefault(bucketLength -> 4)
 
   /**
@@ -116,7 +116,7 @@ private[feature] trait ReliefClsSelectorParams extends Params
   
   final val numNeighbors = new IntParam(this, "numNeighbors", "",
     ParamValidators.gtEq(1))
-  setDefault(numNeighbors -> 25)
+  setDefault(numNeighbors -> 10)
   
   final val estimationRatio: DoubleParam = new DoubleParam(this, "estimationRatio", "", ParamValidators.inRange(0,1))
   setDefault(estimationRatio -> 0.25)
@@ -125,8 +125,7 @@ private[feature] trait ReliefClsSelectorParams extends Params
   setDefault(batchSize -> 0.1)
   
   final val queryStep: IntParam = new IntParam(this, "queryStep", "", ParamValidators.gtEq(1))
-  setDefault(queryStep -> 2)
-  
+  setDefault(queryStep -> 2)  
   
   final val redundancyRemoval: BooleanParam = new BooleanParam(this, "redundancyRemoval", "")
   setDefault(redundancyRemoval -> true)
@@ -135,37 +134,43 @@ private[feature] trait ReliefClsSelectorParams extends Params
 
 /**
  * :: Experimental ::
- * Chi-Squared feature selection, which selects categorical features to use for predicting a
- * categorical label.
+ * Relief feature selection, which relies on distance measurements among neighbors to weight features.
  */
 @Experimental
-final class ReliefClsSelector @Since("1.6.0") (@Since("1.6.0") override val uid: String = Identifiable.randomUID("ReliefClsSelector"))
-    extends Estimator[ReliefClsSelectorModel] with ReliefClsSelectorParams with DefaultParamsWritable {
+final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: String = Identifiable.randomUID("ReliefFRSelector"))
+    extends Estimator[ReliefFRSelectorModel] with ReliefFRSelectorParams with DefaultParamsWritable {
 
   /** @group setParam */
-  @Since("1.6.0")
-  def setNumTopFeatures(value: Int): this.type = set(numTopFeatures, value)
-
-  /** @group setParam */
-  @Since("1.6.0")
   def setOutputCol(value: String): this.type = set(outputCol, value)
-
-  /** @group setParam */
-  @Since("1.6.0")
   def setLabelCol(value: String): this.type = set(labelCol, value)
-
+  def setInputCol(value: String): this.type = set(inputCol, value)
+  def setSeed(value: Long): this.type = set(seed, value)
+  def setNumHashTables(value: Int): this.type = set(numHashTables, value)
+  def setSignatureSize(value: Int): this.type = set(signatureSize, value)  
+  def setBucketLength(value: Double): this.type = set(bucketLength, value)
+  def setNumTopFeatures(value: Int): this.type = set(numTopFeatures, value)
+  def setNumNeighbors(value: Int): this.type = set(numNeighbors, value)
+  def setEstimationRatio(value: Double): this.type = set(estimationRatio, value)
+  def setBatchSize(value: Double): this.type = set(batchSize, value)
+  def setQueryStep(value: Int): this.type = set(queryStep, value) 
+  def setRedundancyRemoval(value: Boolean): this.type = set(redundancyRemoval, value)
   
-    // Case class for criteria/feature
-    case class F(feat: Int, crit: Double)
+  // Case class for criteria/feature
+  case class F(feat: Int, crit: Double)
+  
+  override def transformSchema(schema: StructType): StructType = {
+    SchemaUtils.checkColumnType(schema, $(inputCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(labelCol), DoubleType)
+    SchemaUtils.appendColumn(schema, $(outputCol), new VectorUDT)
+  }
   
   @Since("2.0.0")
-  override def fit(dataset: Dataset[_]): ReliefClsSelectorModel = {
+  override def fit(dataset: Dataset[_]): ReliefFRSelectorModel = {
     
     transformSchema(dataset.schema, logging = true)
     val continuous = true
     
-    // Get Hash Value of the key
-    
+    // Get Hash Value of the key    
     val brp = new BucketedRandomProjectionLSH()
       .setNumHashTables($(numHashTables))
       .setInputCol($(inputCol))
@@ -192,8 +197,12 @@ final class ReliefClsSelector @Since("1.6.0") (@Since("1.6.0") override val uid:
         .mapValues(v => (v.toDouble / nElems).toFloat)
         .map(identity).toMap
   
-    var featureWeights: Array[Float] = Array.emptyFloatArray
-    var redundancyMatrix: DenseMatrix[Float] = DenseMatrix.zeros(nFeat, nFeat)
+    var normalizedWeights: Option[DenseVector[Float]] = None
+    var featureWeights: DenseVector[Float] = DenseVector.zeros(nFeat)
+    var jointMatrix: DenseMatrix[Float] = DenseMatrix.zeros(nFeat, nFeat)
+    var marginalVector: DenseVector[Float] = DenseVector.zeros(nFeat)
+    
+    var total = 0L // total number of comparisons at the collision level
     for(batchIndex <- 0 until batches.size) {
       val query = batches(batchIndex)
       val modelQuery: DataFrame = if (!query.columns.contains($(outputCol))) {
@@ -203,23 +212,36 @@ final class ReliefClsSelector @Since("1.6.0") (@Since("1.6.0") override val uid:
       }  
     
       // Index query objects and compute the table that indicates where are located its neighbors
-      val idxModelQuery = modelQuery.withColumn("UniqueID", monotonically_increasing_id).cache()
+      val idxModelQuery = modelQuery.withColumn("UniqueID", monotonically_increasing_id)
       val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(
           idxModelQuery.select("UniqueID", $(inputCol), $(labelCol), $(outputCol)).collect())
       val neighbors: RDD[(Long, Map[Short, Iterable[Int]])] = approxNNByPartition(modelDataset, 
           bFullQuery, LSHmodel, $(numNeighbors) * priorClass.size)
       val bNeighborsTable: Broadcast[Map[Long, Map[Short, Iterable[Int]]]] = 
-        sc.broadcast(neighbors.collectAsMap().toMap)
+          sc.broadcast(neighbors.collectAsMap().toMap)
   
-      val partialResults = computeReliefWeights(
+      val (partialRelief, partialJoint, partialMarginal, partialCount) = computeReliefWeights(
           modelDataset.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
-          priorClass, nFeat, nElems, continuous, featureWeights)
-      featureWeights = partialResults._1
-      redundancyMatrix = partialResults._2
+          priorClass, nFeat, nElems, continuous, normalizedWeights)
+      total += partialCount
+      featureWeights += partialRelief
+      jointMatrix += partialJoint.toDenseMatrix
+      marginalVector += partialMarginal
+      
+      val maxRelief = breeze.linalg.max(featureWeights)
+      val minRelief = breeze.linalg.min(featureWeights)
+      normalizedWeights = Some(featureWeights.map(score => 
+        ((score - minRelief) / (maxRelief - minRelief)).toFloat))      
     }
+    // normalized redundancy
+    val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat, continuous)
+    val (relief, reliefCol) = selectFeatures(normalizedWeights.get, redundancyMatrix)
+    val outRC = reliefCol.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
+    val outR = relief.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
+    println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
+    println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
     
-    val (relief, reliefCol) = selectFeatures(nFeat, featureWeights.zipWithIndex.map(_.swap), redundancyMatrix)
-    val model = new ReliefClsSelectorModel(uid, relief.map {_.feat}.toArray, reliefCol.map {_.feat}.toArray)
+    val model = new ReliefFRSelectorModel(uid, relief.map(_.feat).toArray, reliefCol.map(_.feat).toArray)
     copyValues(model)
   }
   
@@ -231,18 +253,18 @@ final class ReliefClsSelector @Since("1.6.0") (@Since("1.6.0") override val uid:
       nFeat: Int,
       nElems: Long,
       isCont: Boolean,
-      oldReliefWeights: Array[Float] = Array.emptyFloatArray
+      oldReliefWeights: Option[DenseVector[Float]] = None
       ) = {
     
      // Initialize accumulators for RELIEF+Collision computation
     val sc = modelDataset.sparkSession.sparkContext
-    val accMarginal = new DoubleVectorAccumulator(nFeat); sc.register(accMarginal, "marginal")
+    val accMarginal = new VectorAccumulator(nFeat); sc.register(accMarginal, "marginal")
     val accJoint = new MatrixAccumulator(nFeat, nFeat);  sc.register(accJoint, "joint")
     val neighborClassCount = new LongVectorAccumulator(nFeat + 1); sc.register(neighborClassCount, "classCount")
-    val lowerTh = 0.75f
     val label2Num = priorClass.zipWithIndex.map{case (k, v) => k._1 -> v.toShort}
     val bLabel2Num = sc.broadcast(label2Num) 
     val bOldRW = sc.broadcast(oldReliefWeights)
+    val lowerTh = .8f
     
     val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { 
       case(pindex, it) =>
@@ -252,13 +274,13 @@ final class ReliefClsSelector @Since("1.6.0") (@Since("1.6.0") override val uid:
         val labelConversion = bLabel2Num.value
         // last position is reserved to negative weights from central instances.
         val reliefWeights = breeze.linalg.DenseMatrix.zeros[Float](nFeat, labelConversion.size + 1) 
-        val marginal = breeze.linalg.DenseVector.zeros[Double](nFeat)
-        val joint = breeze.linalg.DenseMatrix.zeros[Double](nFeat, nFeat)
+        val marginal = breeze.linalg.DenseVector.zeros[Float](nFeat)
+        val joint = breeze.linalg.DenseMatrix.zeros[Float](nFeat, nFeat)
         val classCounter = breeze.linalg.DenseVector.zeros[Long](labelConversion.size + 1)
         val r = new scala.util.Random($(seed))
         // Data are assumed to be scaled to have 0 mean, and 1 std
-        val vote = if(isCont) (d: Double) => 1 - math.min(6.0, d) / 6.0 else (d: Double) => Double.MinPositiveValue
-        val ow = if(bOldRW.value.isEmpty) Array.fill(nFeat)(1.0f) else bOldRW.value
+        val vote = if(isCont) (d: Double) => 1 - math.min(6.0, d).toFloat / 6.0f else (d: Double) => Float.MinPositiveValue
+        val ow = bOldRW.value match { case Some(v) => v; case None => DenseVector.fill(nFeat, 1.0f) }
         
         query.map{ case Row(qid: Long, qinput: Vector, qlabel: Double, _) =>
             
@@ -267,34 +289,39 @@ final class ReliefClsSelector @Since("1.6.0") (@Since("1.6.0") override val uid:
         
             table.get(qid) match { case Some(localMap) =>
                 val neighbors = localMap.getOrElse(pindex.toShort, Iterable.empty)
-                neighbors.map{ lidx =>
-                  val Row(ninput: Vector, nlabel: Double) = localExamples(lidx)
-                  var collisioned = Queue[Int]() // annotate the features matched up to now
-                  val pcounter = Array.fill(nFeat)(0.0d) // count the strength of collision in each feature
-                  val jvote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else 
-                    (i1: Int, i2: Int) => pcounter(i1)
-                  val labelIndex = if(nlabel != qlabel) labelConversion.get(nlabel.toFloat).get else labelConversion.size
-                  classCounter(labelIndex) += 1  
-                        
-                  qinput.foreachActive{ (index, value) =>
-                     val fdistance = math.abs(value - ninput(index))
-                     //// RELIEF Computations
-                     reliefWeights(index)(labelIndex) += fdistance.toFloat
-                     //// Collision-based computations
-                     // The closer the distance, the more probable.
-                     // The higher the score in the previous rank, the more probable.
-                     if(fdistance <= condition && condition2(index)){
-                        val contribution = vote(fdistance)
-                        marginal(index) += contribution
-                        pcounter(index) = contribution
-                        val fit = collisioned.iterator
-                        while(fit.hasNext){
-                          val i2 = fit.next
-                          joint(i2, index) += jvote(index, i2)
-                        }                         
-                        collisioned += index
-                     }
-                  }
+                val boundary = neighbors.exists { i => 
+                  val Row(_, nlabel: Double) = localExamples(i)
+                  nlabel != qlabel }
+                if(boundary) { // Only boundary points allowed, omitted those homogeneous with the class
+                  neighbors.map{ lidx =>
+                    val Row(ninput: Vector, nlabel: Double) = localExamples(lidx)
+                    var collisioned = Queue[Int]() // annotate the features matched up to now
+                    val pcounter = Array.fill(nFeat)(0.0f) // count the strength of collision in each feature
+                    val jvote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else 
+                      (i1: Int, i2: Int) => pcounter(i1)
+                    val labelIndex = if(nlabel != qlabel) labelConversion.get(nlabel.toFloat).get else labelConversion.size
+                    classCounter(labelIndex) += 1  
+                          
+                    qinput.foreachActive{ (index, value) =>
+                       val fdistance = math.abs(value - ninput(index))
+                       //// RELIEF Computations
+                       reliefWeights(index)(labelIndex) += fdistance.toFloat
+                       //// Collision-based computations
+                       // The closer the distance, the more probable.
+                       // The higher the score in the previous rank, the more probable.
+                       if(fdistance <= condition && condition2(index)){
+                          val contribution = vote(fdistance)
+                          marginal(index) += contribution
+                          pcounter(index) = contribution
+                          val fit = collisioned.iterator
+                          while(fit.hasNext){
+                            val i2 = fit.next
+                            joint(i2, index) += jvote(index, i2)
+                          }                         
+                          collisioned += index
+                       }
+                    }
+                  }  
                 }
               case None =>
                 System.err.println("Instance does not found in the table")
@@ -316,18 +343,19 @@ final class ReliefClsSelector @Since("1.6.0") (@Since("1.6.0") override val uid:
         prop * weights(index) / clsC(index)
       }.sum  
       sum -= weights(weights.size) / clsC(weights.size)
-      sum / nElems
+      sum
     }.toArray
+    val dReliefWeights = new DenseVector(reliefWeights)
     
-    val maxRelief = reliefWeights.max
-    val minRelief = reliefWeights.min
-    val normalizedRelief = reliefWeights.map(score => ((score - minRelief) / (maxRelief - minRelief)).toFloat)
-    
+    (dReliefWeights, accJoint.value, accMarginal.value, clsC.sum)
+  }
+  
+  private def computeRedudancy(rawJoint: DenseMatrix[Float], rawMarginal: DenseVector[Float], 
+      total: Long, nFeat: Int, isCont: Boolean) = {
     // Now compute redundancy based on collisions and normalize it
     val factor = if(isCont) 1.0 else Double.MinPositiveValue
-    val total = clsC.sum
-    val marginal = accMarginal.value.toDenseVector.mapPairs{ case(_, e) => e /  (total * factor) }  
-    val joint = accJoint.value.toDenseMatrix.mapPairs{ case(_, e) => e /  (total * factor) }  
+    val marginal = rawMarginal.mapPairs{ case(_, e) => e /  (total * factor) }  
+    val joint = rawJoint.mapPairs{ case(_, e) => e /  (total * factor) }  
     
     // Compute mutual information using collisions with and without class
     val redundancyMatrix = breeze.linalg.DenseMatrix.zeros[Float](nFeat, nFeat)
@@ -339,11 +367,8 @@ final class ReliefClsSelector @Since("1.6.0") (@Since("1.6.0") override val uid:
     }    
     val maxRed = breeze.linalg.max(redundancyMatrix)
     val minRed = breeze.linalg.min(redundancyMatrix)
-    val normRedundancyMatrix = redundancyMatrix.mapValues{ e => ((e - minRed) / (maxRed - minRed)).toFloat }
-    
-    (normalizedRelief, normRedundancyMatrix)
+    redundancyMatrix.map{ e => ((e - minRed) / (maxRed - minRed)).toFloat }
   }
-  
   
     // TODO: Fix the MultiProbe NN Search in SPARK-18454
   private def approxNNByPartition(
@@ -382,26 +407,18 @@ final class ReliefClsSelector @Since("1.6.0") (@Since("1.6.0") override val uid:
     neighbors
   }
   
-   def selectFeatures(nfeatures: Int, reliefRanking: Array[(Int, Float)],
+   def selectFeatures(reliefRanking: DenseVector[Float],
       redundancyMatrix: breeze.linalg.DenseMatrix[Float]): (Seq[F], Seq[F]) = {
     
+    val nfeatures = reliefRanking.size
     val attAlive = Array.fill(nfeatures)(true)
     // Initialize all (except the class) criteria with the relevance values
-    val pool = Array.fill[FeatureScore](nfeatures) {
-      val crit = new FeatureScore().init(Float.NegativeInfinity)
-      crit.valid = false
-      crit
-    }
+    val pool = reliefRanking.map(mi => new FeatureScore().init(mi.toFloat)).toArray.zipWithIndex
     
-    reliefRanking.foreach {
-      case (x, mi) =>
-        pool(x) = new FeatureScore().init(mi.toFloat)
-    }
-
     // Get the maximum and initialize the set of selected features with it
-    val (max, mid) = pool.zipWithIndex.maxBy(_._1.relevance)
+    val (max, mid) = pool.maxBy(_._1.relevance)
     var selected = Seq(F(mid, max.score))
-    pool(mid).valid = false
+    max.valid = false
     
     var moreFeat = true
     // Iterative process for redundancy and conditional redundancy
@@ -416,21 +433,22 @@ final class ReliefClsSelector @Since("1.6.0") (@Since("1.6.0") override val uid:
       // Update criteria with the new redundancy values      
       redundancies.par.foreach({
         case (mi, k) =>            
-          pool(k).update(mi.toFloat)
+          pool(k)._1.update(mi.toFloat)
       })
       
       // select the best feature and remove from the whole set of features
-      val (max, maxi) = pool.zipWithIndex.filter(_._1.valid).sortBy(c => (-c._1.score, c._2)).head
+      val (max, maxi) = pool.filter(_._1.valid).maxBy(c => (-c._1.score, c._2))
       
       if (maxi != -1) {
         selected = F(maxi, max.score) +: selected
-        pool(maxi).valid = false
+        max.valid = false
       } else {
         moreFeat = false
       }
     }
-    val reliefNoColl = reliefRanking.sortBy(r => (-r._2, r._1))
-        .slice(0, $(numTopFeatures)).map{ case(id, score) => F(id, score)}.toSeq
+    val reliefNoColl = reliefRanking.toArray.zipWithIndex.map{ case(score, id) => F(id, score)}
+        .sortBy(f => (-f.crit, f.feat))
+        .slice(0, $(numTopFeatures)).toSeq
     (selected.reverse, reliefNoColl)  
   }
   
@@ -461,46 +479,34 @@ final class ReliefClsSelector @Since("1.6.0") (@Since("1.6.0") override val uid:
   } 
    
   private def log2(x: Double) = { math.log(x) / math.log(2) }
-  
 
-  override def transformSchema(schema: StructType): StructType = {
-    SchemaUtils.checkColumnType(schema, $(inputCol), new VectorUDT)
-    SchemaUtils.checkColumnType(schema, $(labelCol), DoubleType)
-    SchemaUtils.appendColumn(schema, $(outputCol), new VectorUDT)
-  }
-
-  override def copy(extra: ParamMap): ReliefClsSelector = defaultCopy(extra)
+  override def copy(extra: ParamMap): ReliefFRSelector = defaultCopy(extra)
 }
 
 @Since("1.6.0")
-object ReliefClsSelector extends DefaultParamsReadable[ReliefClsSelector] {
+object ReliefFRSelector extends DefaultParamsReadable[ReliefFRSelector] {
 
   @Since("1.6.0")
-  override def load(path: String): ReliefClsSelector = super.load(path)
+  override def load(path: String): ReliefFRSelector = super.load(path)
 }
 
 /**
  * :: Experimental ::
- * Model fitted by [[ReliefClsSelector]].
+ * Model fitted by [[ReliefFRSelector]].
  */
 @Experimental
-final class ReliefClsSelectorModel private[ml] (
+final class ReliefFRSelectorModel private[ml] (
   @Since("1.6.0") override val uid: String,
   private val reliefFeatures: Array[Int],
   private val reliefColFeatures: Array[Int]
 )
-    extends Model[ReliefClsSelectorModel] with ReliefClsSelectorParams with MLWritable {
+    extends Model[ReliefFRSelectorModel] with ReliefFRSelectorParams with MLWritable {
 
-  import ReliefClsSelectorModel._
-
-    /** @group setParam */
-  def setInputCol(value: String): this.type = set(inputCol, value)
-
-  /** @group setParam */
+  import ReliefFRSelectorModel._
+  
   def setOutputCol(value: String): this.type = set(outputCol, value)
-
-  /** @group setParam */
-  def setLabelCol(value: String): this.type = set(labelCol, value)
+  def setInputCol(value: String): this.type = set(inputCol, value)
+  def setRedundancyRemoval(value: Boolean): this.type = set(redundancyRemoval, value)
 
   override def transform(dataset: Dataset[_]): DataFrame = {
     val transformedSchema = transformSchema(dataset.schema, logging = true)
@@ -525,60 +531,61 @@ final class ReliefClsSelectorModel private[ml] (
    * Prepare the output column field, including per-feature metadata.
    */
   private def prepOutputField(schema: StructType): StructField = {
-    val selector = ReliefClsSelector.selectedFeatures.toSet
-    val origAttrGroup = AttributeGroup.fromStructField(schema($(featuresCol)))
+    val origAttrGroup = AttributeGroup.fromStructField(schema($(inputCol)))
     val featureAttributes: Array[Attribute] = if (origAttrGroup.attributes.nonEmpty) {
-      origAttrGroup.attributes.get.zipWithIndex.filter(x => selector.contains(x._2)).map(_._1)
+      origAttrGroup.attributes.get.zipWithIndex.filter(x => reliefFeatures.contains(x._2)).map(_._1)
     } else {
-      Array.fill[Attribute](selector.size)(NumericAttribute.defaultAttr)
+      Array.fill[Attribute](reliefFeatures.size)(NumericAttribute.defaultAttr)
     }
     val newAttributeGroup = new AttributeGroup($(outputCol), featureAttributes)
     newAttributeGroup.toStructField()
   }
 
-  override def copy(extra: ParamMap): ReliefClsSelectorModel = {
-    val copied = new ReliefClsSelectorModel(uid, ReliefClsSelector)
+  override def copy(extra: ParamMap): ReliefFRSelectorModel = {
+    val copied = new ReliefFRSelectorModel(uid, reliefFeatures, reliefColFeatures)
     copyValues(copied, extra).setParent(parent)
   }
 
   @Since("1.6.0")
-  override def write: MLWriter = new ReliefClsSelectorModelWriter(this)
+  override def write: MLWriter = new ReliefFRSelectorModelWriter(this)
 }
 
 @Since("1.6.0")
-object ReliefClsSelectorModel extends MLReadable[ReliefClsSelectorModel] {
+object ReliefFRSelectorModel extends MLReadable[ReliefFRSelectorModel] {
 
-  private[ReliefClsSelectorModel] class ReliefClsSelectorModelWriter(instance: ReliefClsSelectorModel) extends MLWriter {
+  private[ReliefFRSelectorModel] class ReliefFRSelectorModelWriter(instance: ReliefFRSelectorModel) extends MLWriter {
 
-    private case class Data(selectedFeatures: Seq[Int])
+    private case class Data(reliefFeatures: Array[Int], reliefColFeatures: Array[Int])
 
     override protected def saveImpl(path: String): Unit = {
       DefaultParamsWriter.saveMetadata(instance, path, sc)
-      val data = Data(instance.selectedFeatures.toSeq)
+      val data = Data(instance.reliefFeatures, instance.reliefColFeatures)
       val dataPath = new Path(path, "data").toString
       sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
     }
   }
 
-  private class ReliefClsSelectorModelReader extends MLReader[ReliefClsSelectorModel] {
+  private class ReliefFRSelectorModelReader extends MLReader[ReliefFRSelectorModel] {
 
-    private val className = classOf[ReliefClsSelectorModel].getName
+    private val className = classOf[ReliefFRSelectorModel].getName
 
-    override def load(path: String): ReliefClsSelectorModel = {
+    override def load(path: String): ReliefFRSelectorModel = {
       val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
       val dataPath = new Path(path, "data").toString
-      val data = sparkSession.read.parquet(dataPath).select("selectedFeatures").head()
-      val selectedFeatures = data.getAs[Seq[Int]](0).toArray
-      val oldModel = new feature.ReliefClsSelectorModel(selectedFeatures)
-      val model = new ReliefClsSelectorModel(metadata.uid, oldModel)
+      val data = sparkSession.read.parquet(dataPath)
+      val Row(reliefFeatures: Array[Int], reliefColFeatures: Array[Int]) =
+        MLUtils.convertVectorColumnsToML(data, "reliefFeatures", "reliefColFeatures")
+          .select("originalMin", "originalMax")
+          .head()
+      val model = new ReliefFRSelectorModel(metadata.uid, reliefFeatures, reliefColFeatures)
       DefaultParamsReader.getAndSetParams(model, metadata)
       model
     }
   }
 
   @Since("1.6.0")
-  override def read: MLReader[ReliefClsSelectorModel] = new ReliefClsSelectorModelReader
+  override def read: MLReader[ReliefFRSelectorModel] = new ReliefFRSelectorModelReader
 
   @Since("1.6.0")
-  override def load(path: String): ReliefClsSelectorModel = super.load(path)
+  override def load(path: String): ReliefFRSelectorModel = super.load(path)
 }
