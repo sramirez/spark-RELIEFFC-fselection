@@ -105,10 +105,9 @@ object MainMLlibTest {
     continuous = params.getOrElse("continuous", "true").toBoolean
     mrmr = params.getOrElse("mrmr", "false").toBoolean
     lowerFeatThreshold = params.getOrElse("lowerFeatThreshold", "0.5").toFloat
-    numHashTables = params.getOrElse("numHashTables", "30").toInt
-    bucketWidth = params.getOrElse("bucketWidth", "4").toInt
-    signatureSize = params.getOrElse("signatureSize", "10").toInt
-    percTest = params.getOrElse("percTest", "0.2f").toFloat
+    numHashTables = params.getOrElse("numHashTables", "10").toInt
+    bucketWidth = params.getOrElse("bucketWidth", "12").toInt
+    signatureSize = params.getOrElse("signatureSize", "5").toInt
     batchSize = params.getOrElse("batchSize", "0.25f").toFloat
     estimationRatio = params.getOrElse("estimationRatio", "1.0f").toFloat
     queryStep = params.getOrElse("queryStep", "2").toInt    
@@ -597,7 +596,7 @@ object MainMLlibTest {
   
   def testFinalSelector() {
     val rawDF = TestHelper.readCSVData(sqlContext, pathFile, firstHeader)
-    val df = preProcess(rawDF).select(clsLabel, inputLabel).cache
+    val df = preProcess(rawDF).select(clsLabel, inputLabel).repartition(nPartitions).cache
     val allVectorsDense = true
     df.show
     
@@ -612,6 +611,8 @@ object MainMLlibTest {
       .setBucketLength(bucketWidth)
       .setSignatureSize(signatureSize)
       .setSeed(seed)
+      .setNumNeighbors(k)
+      .setNumTopFeatures(nselect)
       .setEstimationRatio(estimationRatio)
       .setBatchSize(batchSize)
       .setLowerFeatureThreshold(lowerFeatThreshold)
