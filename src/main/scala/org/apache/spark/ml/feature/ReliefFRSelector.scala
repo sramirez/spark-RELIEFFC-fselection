@@ -225,11 +225,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(idxModelQuery.select(
           col("UniqueID"), col($(inputCol)), col($(labelCol)), col(hashOutputCol)).collect())
           
-      /*val asd = idxModelQuery.schema.fields
-      bFullQuery.value.foreach { case r => 
-        val temp = r.getAs[WrappedArray[]](3) 
-        r.toString()
-      } */   
       println(bFullQuery.value.mkString("\n"))
       val neighbors: RDD[(Long, Map[Short, Iterable[Int]])] = approxNNByPartition(modelDataset, 
           bFullQuery, LSHmodel, $(numNeighbors) * priorClass.size)
@@ -312,6 +307,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         val marginal = breeze.linalg.DenseVector.zeros[Double](nFeat)
         val joint = breeze.linalg.DenseMatrix.zeros[Double](nFeat, nFeat)
         val classCounter = breeze.linalg.DenseVector.zeros[Long](labelConversion.size + 1)
+        
         val r = new scala.util.Random($(seed))
         // Data are assumed to be scaled to have 0 mean, and 1 std
         val vote = if(isCont) (d: Double) => 1 - math.min(6.0, d) / 6.0 else (d: Double) => Double.MinPositiveValue
@@ -322,7 +318,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             val condition = if(isCont) 6 * (1 - (lowerDistanceTh + r.nextFloat() * lowerDistanceTh)) else 0.0f
             val featThreshold = lowerFeatureTh + r.nextFloat() * lowerFeatureTh
             val condition2 = bRanking.value.map{ _ >= featThreshold}
-            val localCounter = breeze.linalg.DenseVector.zeros[Long](labelConversion.size + 1)
         
             table.get(qid) match { case Some(localMap) =>
                 val neighbors = localMap.getOrElse(pindex.toShort, Iterable.empty)
@@ -331,31 +326,39 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                 if(boundary) { // Only boundary points allowed, omitted those homogeneous with the class
                   neighbors.map{ lidx =>
                     val Row(ninput: Vector, nlabel: Double) = localExamples(lidx)
-                    var collisioned = Queue[Int]() // annotate similar features
+                    var mainCollisioned = Queue[Int](); var auxCollisioned = Queue[Int]() // annotate similar features
                     val pcounter = Array.fill(nFeat)(0.0d) // isolate the strength of collision by feature
                     val jvote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else 
                       (i1: Int, i2: Int) => pcounter(i1)
                     val labelIndex = if(nlabel != qlabel) labelConversion.get(nlabel.toFloat).get else labelConversion.size
-                    classCounter(labelIndex) += 1  
-                    localCounter(labelIndex) += 1
+                    classCounter(labelIndex) += 1
                           
                     qinput.foreachActive{ (index, value) =>
                        val fdistance = math.abs(value - ninput(index))
                        //// RELIEF Computations
                        reliefWeights(index, labelIndex) += fdistance.toFloat
-                       //// Collision-based computations
+                       //// Check if there exist a collision
                        // The closer the distance, the more probable.
-                       // The higher the feature' score in the previous rank, the more probable.
-                       if(fdistance <= condition && condition2(index)){
+                       if(fdistance <= condition){
                           val contribution = vote(fdistance)
                           marginal(index) += contribution
                           pcounter(index) = contribution
-                          val fit = collisioned.iterator
+                          val fit = mainCollisioned.iterator
                           while(fit.hasNext){
                             val i2 = fit.next
                             joint(i2, index) += jvote(index, i2)
-                          }                         
-                          collisioned += index
+                          } 
+                          // Check if redundancy is relevant here. Depends on the feature' score in the previous stage.
+                          if(condition2(index)){ // Relevant, the feature is added to the main group and update auxiliar feat's.
+                            mainCollisioned += index
+                            val fit = auxCollisioned.iterator
+                            while(fit.hasNext){
+                              val i2 = fit.next
+                              joint(i2, index) += jvote(index, i2)
+                            }
+                          } else { // Irrelevant, added to the secondary group
+                            auxCollisioned += index
+                          }
                        }
                     }
                   }  
@@ -416,8 +419,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     case class Localization(part: Short, index: Int)
     val sc = modelDataset.sparkSession.sparkContext
     val hashDistance = model.hashThresholdedDistance(_: Seq[Vector], _: Seq[Vector], $(queryStep))
+    val realDistance = model.keyDistance(_: Vector, _: Vector)
     
-    val neighbors = modelDataset.select(model.getOutputCol).rdd.mapPartitionsWithIndex { 
+    val neighbors = modelDataset.select($(inputCol), model.getOutputCol).rdd.mapPartitionsWithIndex { 
         case (pindex, it) => 
           // Initialize the map composed by the priority queue and the central element's ID
           val query = bModelQuery.value // Fields: "UniqueID", $(inputCol), $(labelCol), "hashOutputCol"
@@ -429,12 +433,15 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           var i = 0
           // First iterate over the local elements, and then over the sampled set (also called query set).
           while(it.hasNext) {
-            val Row(hashNeig: WrappedArray[Vector]) = it.next
+            val Row(inputNeig: Vector, hashNeig: WrappedArray[Vector]) = it.next
             (0 until query.size).foreach { j => 
-               val Row(_, _, _, hashQuery: WrappedArray[Vector]) = query(j) 
-               val dist = hashDistance(hashQuery.array, hashNeig.array)
-               if(dist < Double.PositiveInfinity)
-                 neighbors(j)._2 += dist.toFloat -> Localization(pindex.toShort, i)
+               val Row(_, inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
+               val hdist = hashDistance(hashQuery.array, hashNeig.array)
+               if(hdist < Double.PositiveInfinity) {
+                 val distance = realDistance(inputQuery, inputNeig)
+                 neighbors(j)._2 += distance.toFloat -> Localization(pindex.toShort, i)
+               }
+                 
             }
             i += 1              
           }            
@@ -468,7 +475,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
               .filter(c => attAlive(c._2))
 
       // Update criteria with the new redundancy values      
-      redundancies.par.foreach({
+      redundancies.foreach({
         case (mi, k) =>            
           pool(k)._1.update(mi.toFloat)
       })
@@ -476,7 +483,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       // select the best feature and remove from the whole set of features
       val validFeat = pool.filter(_._1.valid)
       if(!validFeat.isEmpty){
-        val (max, maxi) = validFeat.maxBy(c => (-c._1.score, c._2))      
+        val (max, maxi) = validFeat.maxBy(c => (c._1.score, -c._2))      
         selected = F(maxi, max.score) +: selected
         max.valid = false
       } else {
@@ -496,8 +503,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     var valid = true
   
     def score = {
-      if (selectedSize != 0) {
-        relevance - redundance / selectedSize
+      if (selectedSize > 0) {
+        relevance - (redundance / selectedSize)
       } else {
         relevance
       }
