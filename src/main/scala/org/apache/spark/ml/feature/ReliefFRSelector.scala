@@ -228,30 +228,25 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       println(bFullQuery.value.mkString("\n"))
       val neighbors: RDD[(Long, Map[Short, Iterable[Int]])] = approxNNByPartition(modelDataset, 
           bFullQuery, LSHmodel, $(numNeighbors) * priorClass.size)
-      /*bFullQuery.value.foreach { case r => 
-        val temp = r.getAs[WrappedArray[Vector]](3)
-        val temp2 = r.getAs[Vector](1)
-        val (red, neig) = LSHmodel.approxNearestNeighbors(dataset, temp2, 
-            $(numNeighbors) * priorClass.size, probeMode = "multi", hashOutputCol)
-        r.toString()
-      }*/
       
       val bNeighborsTable: Broadcast[Map[Long, Map[Short, Iterable[Int]]]] = 
           sc.broadcast(neighbors.collectAsMap().toMap)
       println("Neighbors table: " + bNeighborsTable.value.mkString("\n"))
-      val (partialRelief, partialJoint, partialMarginal, partialCount) = computeReliefWeights(
+      val (partialRelief, partialJoint, partialMarginal, partialCount, skipped) = computeReliefWeights(
           modelDataset.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
           priorClass, nFeat, nElems, continuous, normalizedWeights)
       total += partialCount
       featureWeights += partialRelief
       jointMatrix += partialJoint.toDenseMatrix
       marginalVector += partialMarginal
+      println("# omitted instances in this step: " + skipped)
       
       val maxRelief = breeze.linalg.max(featureWeights)
       val minRelief = breeze.linalg.min(featureWeights)
       normalizedWeights = Some(featureWeights.map(score => 
         (score - minRelief) / (maxRelief - minRelief)))      
     }
+        
     // normalized redundancy
     val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat, continuous)
     val (reliefCol, relief) = selectFeatures(normalizedWeights.get, redundancyMatrix)
@@ -303,8 +298,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         
         query.map{ case Row(qid: Long, qinput: Vector, qlabel: Double, _) =>
             
-            val condition = if(isCont) 6 * (1 - (lowerDistanceTh + r.nextFloat() * lowerDistanceTh)) else 0.0f
-            val featThreshold = lowerFeatureTh + r.nextFloat() * lowerFeatureTh
+            val rnumber = r.nextFloat()
+            val condition = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
+            val featThreshold = lowerFeatureTh + rnumber * lowerFeatureTh
             val condition2 = ow.map{ _ >= featThreshold}
             val localRelief = breeze.linalg.DenseMatrix.zeros[Double](nFeat, label2Num.size)
             val classCounter = breeze.linalg.DenseVector.zeros[Long](label2Num.size)
@@ -318,7 +314,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                     val Row(ninput: Vector, nlabel: Double) = localExamples(lidx)
                     var mainCollisioned = Queue[Int](); var auxCollisioned = Queue[Int]() // annotate similar features
                     val pcounter = Array.fill(nFeat)(0.0d) // isolate the strength of collision by feature
-                    val jvote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else 
+                    val jointVote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else 
                       (i1: Int, i2: Int) => pcounter(i1)
                     val labelIndex = label2Num.get(nlabel.toFloat).get
                     classCounter(labelIndex) += 1
@@ -336,7 +332,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                           val fit = mainCollisioned.iterator
                           while(fit.hasNext){
                             val i2 = fit.next
-                            joint(i2, index) += jvote(index, i2)
+                            joint(i2, index) += jointVote(index, i2)
                           } 
                           // Check if redundancy is relevant here. Depends on the feature' score in the previous stage.
                           if(condition2(index)){ // Relevant, the feature is added to the main group and update auxiliar feat's.
@@ -344,7 +340,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                             val fit = auxCollisioned.iterator
                             while(fit.hasNext){
                               val i2 = fit.next
-                              joint(i2, index) += jvote(index, i2)
+                              joint(i2, index) += jointVote(index, i2)
                             }
                           } else { // Irrelevant, added to the secondary group
                             auxCollisioned += index
@@ -375,7 +371,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       Array(reliefWeights).toIterator
     }.reduce(_ + _)
      
-    (rawReliefWeights, accJoint.value, accMarginal.value, totalInteractions.value)
+    (rawReliefWeights, accJoint.value, accMarginal.value, totalInteractions.value, omittedInstances.value)
   }
   
   private def computeRedudancy(rawJoint: DenseMatrix[Double], rawMarginal: DenseVector[Double], 

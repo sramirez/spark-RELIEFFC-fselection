@@ -65,14 +65,12 @@ private[ml] trait BucketedRandomProjectionLSHParams extends Params {
  * vectors) / bucketLength`.
  *
  * @param randUnitVectors An array of random unit vectors. Each vector represents a hash function.
- * @param offsets An array of random scalar values to be summed up to the dot product.
  */
 @Experimental
 @Since("2.1.0")
 class BucketedRandomProjectionLSHModel private[ml](
     override val uid: String,
-    private[ml] val randUnitVectors: Array[Matrix],
-    private[ml] val offsets: DenseVector)
+    private[ml] val randUnitVectors: Array[Matrix])
   extends LSHModel[BucketedRandomProjectionLSHModel] with BucketedRandomProjectionLSHParams {
 
   @Since("2.1.0")
@@ -106,7 +104,7 @@ class BucketedRandomProjectionLSHModel private[ml](
 
   @Since("2.1.0")
   override def copy(extra: ParamMap): BucketedRandomProjectionLSHModel = {
-    val copied = new BucketedRandomProjectionLSHModel(uid, randUnitVectors, offsets).setParent(parent)
+    val copied = new BucketedRandomProjectionLSHModel(uid, randUnitVectors).setParent(parent)
     copyValues(copied, extra)
   }
 
@@ -171,8 +169,7 @@ class BucketedRandomProjectionLSH(override val uid: String)
         DenseMatrix.randn(projectedDim, originalDim, rand)
       }
     }
-    val offsets = Array.fill(projectedDim)(rand.nextDouble() * $(bucketLength))
-    new BucketedRandomProjectionLSHModel(uid, randUnitVectors, new DenseVector(offsets))
+    new BucketedRandomProjectionLSHModel(uid, randUnitVectors)
   }
 
   @Since("2.1.0")
@@ -207,18 +204,13 @@ object BucketedRandomProjectionLSHModel extends MLReadable[BucketedRandomProject
     instance: BucketedRandomProjectionLSHModel) extends MLWriter {
 
     // TODO: Save using the existing format of Array[Vector] once SPARK-12878 is resolved.
-    private case class Data(randUnitVectors: Matrix, offsets: Array[Double])
+    private case class Data(randUnitVectors: Array[Matrix])
 
     override protected def saveImpl(path: String): Unit = {
-      /*DefaultParamsWriter.saveMetadata(instance, path, sc)
-      val numRows = instance.randUnitVectors.length
-      require(numRows > 0)
-      val numCols = instance.randUnitVectors.head.size
-      val values = instance.randUnitVectors.map(_.toArray).reduce(Array.concat(_, _))
-      val randMatrix = Matrices.dense(numRows, numCols, values)
-      val data = Data(randMatrix, instance.offsets)
+      DefaultParamsWriter.saveMetadata(instance, path, sc)
+      val data = Data(instance.randUnitVectors)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)*/
+      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
     }
   }
 
@@ -232,14 +224,10 @@ object BucketedRandomProjectionLSHModel extends MLReadable[BucketedRandomProject
       val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
 
       val dataPath = new Path(path, "data").toString
-      val data = sparkSession.read.parquet(dataPath)
-      val Row(randUnitVectors: Matrix) = MLUtils.convertMatrixColumnsToML(data, "randUnitVectors")
-        .select("randUnitVectors")
-        .head()
-      val offsets = new DenseVector(data.select("selectedFeatures").head().getAs[Array[Double]](0))
+      val data = sparkSession.read.parquet(dataPath).select("randUnitVectors").head()
+      val randUnitVectors = data.getAs[Array[Matrix]](0)
       val model = new BucketedRandomProjectionLSHModel(metadata.uid,
-        Array(randUnitVectors),
-        offsets)
+        randUnitVectors)
 
       DefaultParamsReader.getAndSetParams(model, metadata)
       model
