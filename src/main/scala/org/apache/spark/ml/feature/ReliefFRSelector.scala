@@ -44,6 +44,10 @@ import org.apache.spark.sql.types.DataTypes
 import scala.collection.mutable.WrappedArray
 import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.types.FloatType
+import breeze.linalg.VectorBuilder
+import breeze.linalg.CSCMatrix
+import org.apache.spark.ml.linalg.SparseVector
+import breeze.linalg.mapActiveValues
 
 /**
  * Params for [[ReliefFRSelector]] and [[ReliefFRSelectorModel]].
@@ -302,6 +306,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val bTF = sc.broadcast(topFeatures)
     val lowerDistanceTh = .8f
     val lowerFeatureTh = $(lowerFeatureThreshold)    
+    val sparse = true
     
     val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { 
       case(pindex, it) =>
@@ -310,6 +315,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         val table: Map[Long, Map[Short, Iterable[Int]]] = bNeighborsTable.value
         // last position is reserved to negative weights from central instances.
         val marginal = breeze.linalg.DenseVector.zeros[Double](nFeat)
+        
         val joint = breeze.linalg.DenseMatrix.zeros[Double](nFeat, nFeat)
         val reliefWeights = breeze.linalg.DenseVector.zeros[Float](nFeat)         
         val r = new scala.util.Random($(seed))
@@ -388,6 +394,126 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       // update accumulated matrices  
       accMarginal.add(marginal)
       accJoint.add(joint)
+      reliefWeights.activeIterator
+    }.reduceByKey(_ + _)
+     
+    (rawReliefWeights, accJoint, accMarginal, totalInteractions, omittedInstances)
+  }
+  
+  private def computeReliefWeightsSparse (
+      modelDataset: Dataset[_],
+      bModelQuery: Broadcast[Array[Row]],
+      bNeighborsTable: Broadcast[Map[Long, Map[Short, Iterable[Int]]]],
+      priorClass: Map[Double, Float],
+      nFeat: Int,
+      nElems: Long,
+      isCont: Boolean,
+      topFeatures: Map[Int, Float]
+      ) = {
+    
+     // Initialize accumulators for RELIEF+Collision computation
+    val sc = modelDataset.sparkSession.sparkContext
+    val accMarginal = new VectorAccumulator(nFeat); sc.register(accMarginal, "marginal")
+    val accJoint = new MatrixAccumulator(nFeat, nFeat);  sc.register(accJoint, "joint")
+    val totalInteractions = sc.longAccumulator("totalInteractions")
+    val omittedInstances = sc.longAccumulator("omittedInstances")
+    val label2Num = priorClass.zipWithIndex.map{case (k, v) => k._1 -> v.toShort}
+    val idxPriorClass = priorClass.zipWithIndex.map{case (k, v) => v -> k._2}
+    val bTF = sc.broadcast(topFeatures)
+    val lowerDistanceTh = .8f
+    val lowerFeatureTh = $(lowerFeatureThreshold)    
+    val sparse = true
+    
+    val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { 
+      case(pindex, it) =>
+        val localExamples = it.toArray
+        val query: Array[Row] = bModelQuery.value
+        val table: Map[Long, Map[Short, Iterable[Int]]] = bNeighborsTable.value
+        // last position is reserved to negative weights from central instances.
+        val marginal = new VectorBuilder[Int](nFeat)
+        val joint = new CSCMatrix.Builder[Int](rows=nFeat, cols=nFeat)
+        val reliefWeights = breeze.linalg.DenseVector.zeros[Float](nFeat)         
+        val r = new scala.util.Random($(seed))
+        
+        query.map{ case Row(qid: Long, qinput: SparseVector, qlabel: Double, _) =>
+            
+            val rnumber = r.nextFloat()
+            val condition = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
+            val featThreshold = lowerFeatureTh + rnumber * lowerFeatureTh
+            val condition2 = bTF.value.mapValues{ _ >= featThreshold}
+            val localRelief = new CSCMatrix.Builder[Float](rows=nFeat, cols=label2Num.size)
+            val classCounter = breeze.linalg.DenseVector.zeros[Long](label2Num.size)
+        
+            table.get(qid) match { case Some(localMap) =>
+                val neighbors = localMap.getOrElse(pindex.toShort, Iterable.empty)
+                val boundary = neighbors.exists { i => val Row(_, nlabel: Double) = localExamples(i)
+                  nlabel != qlabel }
+                if(boundary) { // Only boundary points allowed, omitted those homogeneous with the class
+                  neighbors.map{ lidx =>
+                    val Row(ninput: SparseVector, nlabel: Double) = localExamples(lidx)
+                    var mainCollisioned = Queue[Int](); var auxCollisioned = Queue[Int]() // annotate similar features
+                    val labelIndex = label2Num.get(nlabel.toFloat).get
+                    classCounter(labelIndex) += 1
+                    
+                    val v1Indices = qinput.indices; val nnzv1 = v1Indices.length; var kv1 = 0
+                    val v2Indices = ninput.indices; val nnzv2 = v2Indices.length; var kv2 = 0
+                    while (kv1 < nnzv1 || kv2 < nnzv2) {
+                      var score = 0.0
+                      var index = kv1
+            
+                      if (kv2 >= nnzv2 || (kv1 < nnzv1 && v1Indices(kv1) < v2Indices(kv2))) {
+                        score = qinput.values(kv1); kv1 += 1; index = kv1
+                      } else if (kv1 >= nnzv1 || (kv2 < nnzv2 && v2Indices(kv2) < v1Indices(kv1))) {
+                        score = ninput.values(kv2); kv2 += 1; index = kv2
+                      } else {
+                        score = qinput.values(kv1) - ninput.values(kv2); kv1 += 1; kv2 += 1; index = kv1
+                      }
+                      val fdistance = math.abs(score)
+                      //// RELIEF Computations
+                      localRelief.add(index, labelIndex, fdistance.toFloat)
+                      //// Check if there exist a collision
+                      // The closer the distance, the more probable.
+                      if(fdistance <= condition){
+                        marginal.add(index, 1)
+                        val fit = mainCollisioned.iterator
+                        while(fit.hasNext){
+                          val i2 = fit.next
+                          joint.add(i2, index, 1)
+                        } 
+                        // Check if redundancy is relevant here. Depends on the feature' score in the previous stage.
+                        if(condition2.getOrElse(index, false)){ // Relevant, the feature is added to the main group and update auxiliar feat's.
+                          mainCollisioned += index
+                          val fit = auxCollisioned.iterator
+                          while(fit.hasNext){
+                            val i2 = fit.next
+                            joint.add(i2, index, 1)
+                          }
+                        } else { // Irrelevant, added to the secondary group
+                          auxCollisioned += index
+                        }
+                       }
+                    }
+                  }  
+                } else {
+                  omittedInstances.add(1)
+                }
+              case None =>
+                System.err.println("Instance does not found in the table")
+            }
+         val denom = 1 - priorClass.get(qlabel).get
+         val indWeights = localRelief.result.mapActivePairs{ case((feat, cls), value) =>  
+           if(cls != qlabel){
+             ((idxPriorClass.get(cls).get / denom) * value / classCounter(cls)).toFloat 
+           } else {
+             (-value / classCounter(cls)).toFloat
+           }
+         }
+         reliefWeights += breeze.linalg.sum(indWeights, Axis._1)
+         totalInteractions.add(classCounter.sum)
+      }(breeze.linalg.support.CanMapKeyValuePairs[breeze.linalg.CSCMatrix[Float],(Int, Int),Float,Float,Float])
+      // update accumulated matrices  
+      accMarginal.add(marginal.toSparseVector)
+      accJoint.add(joint.result)
       reliefWeights.activeIterator
     }.reduceByKey(_ + _)
      
