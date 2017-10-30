@@ -50,6 +50,10 @@ import breeze.linalg.mapActiveValues
 import breeze.linalg.HashVector
 import breeze.collection.mutable.OpenAddressHashArray
 import scala.collection.mutable.HashMap
+import breeze.linalg.{Matrix => BM, Vector => BV, DenseMatrix => BDM, DenseVector => BDV}
+import breeze.generic.UFunc
+import breeze.generic.MappingUFunc
+import breeze.linalg.support._
 
 /**
  * Params for [[ReliefFRSelector]] and [[ReliefFRSelectorModel]].
@@ -221,11 +225,13 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     var featureWeights: DenseVector[Float] = DenseVector.zeros(nFeat)
     var jointMatrix: DenseMatrix[Double] = DenseMatrix.zeros(nFeat, nFeat)
     var marginalVector: DenseVector[Double] = DenseVector.zeros(nFeat)
-    var topFeatures: Map[Int, Float] = (0 until nFeat).map(i => i -> 0.0f).toMap
+    var topFeatures: Map[Int, Float] = Map.empty
     
     var total = 0L // total number of comparisons at the collision level
-    for(batchIndex <- 0 until batches.size) {
-      val query = batches(batchIndex)
+    val results: Array[Dataset[_]] = Array.fill(batches.size)(spark.emptyDataFrame)
+    var finalWeights: Dataset[_] = spark.emptyDataFrame
+    for(i <- 0 until batches.size) {
+      val query = batches(i)
       val modelQuery: DataFrame = if (!query.columns.contains(hashOutputCol)) {
         LSHmodel.transform(query)
       } else {
@@ -243,33 +249,49 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       val bNeighborsTable: Broadcast[Map[Long, Map[Short, Iterable[Int]]]] = 
           sc.broadcast(neighbors.collectAsMap().toMap)
       
-      val (rawWeights: RDD[(Int, Float)], partialJoint, partialMarginal, partialCount, skipped) = computeReliefWeights(
-          modelDataset.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
+      val (rawWeights: RDD[(Int, Float)], partialJoint, partialMarginal, partialCount, skipped) = 
+        computeReliefWeights(modelDataset.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
           priorClass, nFeat, nElems, continuous, topFeatures)
-
-      val partialRelief = rawWeights.cache()
-      partialRelief.collect().par.foreach{ case(k,v) => featureWeights(k) += v } 
+      
+      // Normalize previous results and return the best features
+      val schema = new StructType().add(StructField("id" + i, IntegerType, true))
+            .add(StructField("score" + i, FloatType, true))
+      results(i) = spark.createDataFrame(rawWeights.map{ case(k,v) => Row(k,v)}, schema).cache()
+      val normalized = normalizeRankingDF(results(i))
+      val quantile = normalized.stat.approxQuantile("score" + i, Array($(lowerFeatureThreshold)), 0.05)(0)
+      topFeatures = normalized.filter(normalized.col("score" + i).geq(quantile)).collect().map { 
+        case Row(id: Int, score: Float) => id -> score}.toMap
+        
+      // Partial statistics for redundancy and others
       total += partialCount.value
       jointMatrix += partialJoint.value
       marginalVector += partialMarginal.value
       println("# omitted instances in this step: " + skipped)
-      
-      // Normalize previous results and return the best features
-      val partialReliefDF = spark.createDataFrame(partialRelief.map{ case(k,v) => Row(k,v)}, schema)
-      val normalized = normalizeRankingDF(partialReliefDF).cache()
-      normalized.show
-      val quantile = normalized.stat.approxQuantile("score", Array($(lowerFeatureThreshold)), 0.05)(0)
-      topFeatures = normalized.filter(normalized.col("score").geq(quantile)).collect().map { 
-        case Row(id: Int, score: Float) => id -> score}.toMap
-    }
         
-    val maxRelief = breeze.linalg.max(featureWeights)
-    val minRelief = breeze.linalg.min(featureWeights)
-    val finalWeights = featureWeights.mapActiveValues(score => 
-        (score - minRelief) / (maxRelief - minRelief))
+      if(i > 1){
+        finalWeights = finalWeights.join(results(i), finalWeights("id0") === results(i)("id" + i))
+          .selectExpr("id0", "score0 + score" + i + " as score0")
+      } else {
+        finalWeights = results(0)
+      }
+       
+    }
+    
+    finalWeights.cache()
+    finalWeights.show
+    val stats = finalWeights.agg(max("score0"), min("score0")).head()
+    val maxRelief = stats.getAs[Double](0); val minRelief = stats.getAs[Double](1)
+    val normalizeUDF = udf((x: Float) => (x - minRelief) / (maxRelief - minRelief), DataTypes.FloatType)
+    finalWeights = finalWeights.withColumn("norm-score", normalizeUDF(col("score")))
+    finalWeights.show()
+    
+    // Unpersist partial results
+    (0 until batches.size).foreach(i => results(i).unpersist())
+
     // normalized redundancy
     val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat, continuous)
-    val (reliefCol, relief) = selectFeatures(finalWeights, redundancyMatrix)
+    val rddFinalWeights = finalWeights.rdd.map{ case Row(k: Int, v: Double) => (k,v)}
+    val (reliefCol, relief) = selectFeatures(rddFinalWeights, redundancyMatrix)
     val outRC = reliefCol.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
     val outR = relief.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
     println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
@@ -528,30 +550,45 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     (rawReliefWeights, accJoint, accMarginal, totalInteractions, omittedInstances)
   }
   
-  private def computeRedudancy(rawJoint: DenseMatrix[Double], rawMarginal: DenseVector[Double], 
+  private def computeRedudancy(rawJoint: BM[Double], rawMarginal: BV[Double], 
       total: Long, nFeat: Int, isCont: Boolean) = {
     // Now compute redundancy based on collisions and normalize it
     val factor = if(isCont) 1.0 else Double.MinPositiveValue
-    val marginal = rawMarginal.mapPairs{ case(_, e) => e /  (total * factor) }  
-    val joint = rawJoint.mapPairs{ case(_, e) => e /  (total * factor) }  
+    val marginal = rawMarginal.mapActiveValues(_ /  (total * factor))
     
-    // Compute mutual information using collisions with and without class
-    val redundancyMatrix = breeze.linalg.DenseMatrix.zeros[Float](nFeat, nFeat)
-    var maxRed = Float.NegativeInfinity
-    var minRed = Float.PositiveInfinity
-    joint.activeIterator.foreach { case((i1,i2), value) =>
-      if(i1 < i2) {
-        val red = (value * log2(value / (marginal(i1) * marginal(i2)))).toFloat  
-        val correctedRed = if(!red.isNaN()) red else 0
-        redundancyMatrix(i1, i2) = correctedRed; redundancyMatrix(i2, i1) = correctedRed 
-        if(correctedRed > maxRed) {
-          maxRed = correctedRed 
-        } else if(correctedRed < minRed) {
-          minRed = correctedRed
-        }
-      }        
+    var maxRed = Double.NegativeInfinity; var minRed = Double.PositiveInfinity
+    // Apply the factor and the entropy formula
+    val applyEntropy = (i1: Int, i2: Int, value: Double) => {
+      val red = (value /  (total * factor)) * log2(value / (marginal(i1) * marginal(i2)))  
+      val correctedRed = if(!red.isNaN()) red else 0
+      if(correctedRed > maxRed) {
+        maxRed = correctedRed 
+      } else if(correctedRed < minRed) {
+        minRed = correctedRed
+      }
+      correctedRed
     }
-    redundancyMatrix.mapActiveValues { e => ((e - minRed) / (maxRed - minRed)).toFloat }
+    // Compute the final redundancy matrix with both diagonals to allow direct selection by column id
+    rawJoint match {
+      case bsm: CSCMatrix[Double] => 
+        val upperDiagonal = bsm.copy
+        val lowerDiagonal = new CSCMatrix.Builder[Double](rows = nFeat, cols = nFeat)
+        bsm.activeIterator.foreach{case((i1,i2), value) => 
+          val ent = applyEntropy(i1, i2, value)
+          upperDiagonal(i1, i2) = ent
+          lowerDiagonal.add(i2, i1, ent)
+        }
+        (upperDiagonal + lowerDiagonal.result).mapActiveValues { e => (e - minRed) / (maxRed - minRed) }
+      case bdm: BDM[Double] => 
+        val redm = bdm.copy
+        bdm.foreachPair{ case((i1,i2), value) => 
+          if(i1 > i2) { // We just fulfill and need the upper diagonal
+            val ent = applyEntropy(i1, i2, value)
+            redm(i1, i2) = ent; redm(i2, i1) = ent
+          }
+        }
+        redm.mapValues { e => (e - minRed) / (maxRed - minRed) }   
+    }
   }
   
   // TODO: Fix the MultiProbe NN Search in SPARK-18454
@@ -597,47 +634,52 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     neighbors
   }
   
-   def selectFeatures(reliefRanking: DenseVector[Float],
-      redundancyMatrix: breeze.linalg.DenseMatrix[Float]): (Seq[F], Seq[F]) = {
+   def selectFeatures(reliefRanking: RDD[(Int, Double)],
+      redundancyMatrix: BM[Double]): (Seq[F], Seq[F]) = {
     
-     val attAlive = Array.fill(reliefRanking.size)(true)
     // Initialize all (except the class) criteria with the relevance values
-    val pool = reliefRanking.map(mi => new FeatureScore().init(mi.toFloat)).toArray.zipWithIndex.par
-    
+    val pool = reliefRanking.mapValues(r => new FeatureScore().init(r.toFloat)).collect()
+    val reliefNoColl = reliefRanking.takeOrdered($(numTopFeatures))(Ordering[(Double, Int)].on(f => (-f._2, f._1)))
+      .map{case (feat, crit) => F(feat, crit)}.toSeq
     // Get the maximum and initialize the set of selected features with it
-    val (max, mid) = pool.maxBy(_._1.relevance)
-    var selected = Seq(F(mid, max.score))
-    max.valid = false
-    
+    var selected = Seq(reliefNoColl.head)
+    pool(selected.head.feat)._2.valid = false
     var moreFeat = true
+    
     // Iterative process for redundancy and conditional redundancy
     while (selected.size < $(numTopFeatures) && moreFeat) {
 
-      attAlive(selected.head.feat) = false
-      val redundancies = redundancyMatrix(::, selected.head.feat)
-              .toArray
-              .zipWithIndex
-              .filter(c => attAlive(c._2))
-
       // Update criteria with the new redundancy values      
-      redundancies.foreach({
-        case (mi, k) =>            
-          pool(k)._1.update(mi.toFloat)
-      })
+      redundancyMatrix match{
+        case bsm: CSCMatrix[Double] => 
+          val begin = bsm.colPtrs(selected.head.feat)
+          val end = bsm.colPtrs(selected.head.feat + 1)
+          (begin until end).foreach{ k =>
+            if(pool(k)._2.valid)
+              pool(k)._2.update(bsm.data(bsm.rowIndices(k)).toFloat)
+          }
+        case bdm: BDM[Double] =>
+          (0 until pool.size).foreach{ k =>            
+            if(pool(k)._2.valid)
+              pool(k)._2.update(bdm(k, selected.head.feat).toFloat)
+          }
+      }
       
       // select the best feature and remove from the whole set of features
-      val validFeat = pool.filter(_._1.valid)
-      if(!validFeat.isEmpty){
-        val (max, maxi) = validFeat.maxBy(c => (c._1.score, -c._2))      
+      var max = new FeatureScore().init(Float.NegativeInfinity); var maxi = -1
+      pool.foreach{ case(feat, crit) => 
+        if(crit.valid && crit.score > max.score){
+          maxi = feat; max = crit
+        }
+      }
+      
+      if(maxi > -1){
         selected = F(maxi, max.score) +: selected
         max.valid = false
       } else {
         moreFeat = false
       }
     }
-    val reliefNoColl = reliefRanking.toArray.zipWithIndex.map{ case(score, id) => F(id, score)}
-        .sortBy(f => (-f.crit, f.feat))
-        .slice(0, $(numTopFeatures)).toSeq
     (selected.reverse, reliefNoColl)  
   }
   
