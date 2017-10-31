@@ -68,8 +68,8 @@ object TestHelper {
   
   /** @return standard csv data from the repo.
     */
-  def readCSVData(sqlContext: SQLContext, file: String, header: Boolean = true): DataFrame = {
-       val df = sqlContext.read.format("csv")
+  def readData(sqlContext: SQLContext, file: String, header: Boolean = true, format: String = "csv"): DataFrame = {
+       val df = sqlContext.read.format(format)
         .option("header", header.toString) // Use first line of all files as header
         .option("inferSchema", "true") // Automatically infer data types
         .load(FILE_PREFIX + file)

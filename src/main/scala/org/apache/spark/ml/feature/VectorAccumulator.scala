@@ -7,18 +7,18 @@ import org.apache.spark.util.AccumulatorV2
 /**
  * @author sramirez
  */
-class VectorAccumulator(val rows: Int) extends AccumulatorV2[Vector[Double], Vector[Double]] {
+class VectorAccumulator(val rows: Int, sparse: Boolean) extends AccumulatorV2[Vector[Double], Vector[Double]] {
   
   def this(m: Vector[Double]) = {
-    this(m.size)
+    this(m.size, m.isInstanceOf[SparseVector[Double]])
     this.accVector = m.copy
   }
 
-  private var accVector: Vector[Double] = Vector.zeros[Double](rows)
+  private var accVector: Vector[Double] = if (sparse) SparseVector.zeros(rows) else Vector.zeros(rows)
   private var zero: Boolean = true
 
   def reset(): Unit = {
-    accVector = Vector.zeros[Double](rows)
+    accVector = if (sparse) SparseVector.zeros(rows) else Vector.zeros(rows)
     zero = true
   }
 

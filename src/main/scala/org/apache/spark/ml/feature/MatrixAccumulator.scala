@@ -7,18 +7,18 @@ import org.apache.spark.util.AccumulatorV2
 /**
  * @author sramirez
  */
-class MatrixAccumulator(val rows: Int, val cols: Int) extends AccumulatorV2[Matrix[Double], Matrix[Double]] {
+class MatrixAccumulator(val rows: Int, val cols: Int, sparse: Boolean) extends AccumulatorV2[Matrix[Double], Matrix[Double]] {
   
   def this(m: Matrix[Double]) = {
-    this(m.rows, m.cols)
+    this(m.rows, m.cols, m.isInstanceOf[CSCMatrix[Double]])
     this.accMatrix = m.copy
   }
 
-  private var accMatrix: Matrix[Double] = Matrix.zeros[Double](rows, cols)
+  private var accMatrix: Matrix[Double] = if (sparse) CSCMatrix.zeros(rows, cols) else Matrix.zeros(rows, cols) 
   private var zero: Boolean = true
 
   def reset(): Unit = {
-    accMatrix = Matrix.zeros[Double](rows, cols)
+    accMatrix = if (sparse) CSCMatrix.zeros(rows, cols) else Matrix.zeros(rows, cols) 
     zero = true
   }
 

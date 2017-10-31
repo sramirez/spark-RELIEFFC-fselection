@@ -34,6 +34,7 @@ import org.apache.spark.ml.attribute.AttributeGroup
 import org.apache.spark.ml.attribute.NominalAttribute
 import org.apache.spark.ml.attribute.Attribute
 import org.apache.spark.ml.util.MetadataUtils
+import org.apache.spark.sql.Dataset
 
 
 /**
@@ -66,6 +67,7 @@ object MainMLlibTest {
   var batchSize = 0.25f
   var estimationRatio = 1.0f
   var queryStep = 2
+  var format = "csv"
   
   
   var mrmr: Boolean = false
@@ -112,26 +114,28 @@ object MainMLlibTest {
     estimationRatio = params.getOrElse("estimationRatio", "1.0f").toFloat
     queryStep = params.getOrElse("queryStep", "2").toInt    
     mode = params.getOrElse("mode", "final")
+    format = params.getOrElse("format", "csv")
     
     println("Params used: " +  params.mkString("\n"))
     
+    val rawDF = TestHelper.readData(sqlContext, pathFile, firstHeader, format)
+    rawDF.show
+    val df = preProcess(rawDF).select(clsLabel, inputLabel).cache
+    df.show
+    
     if(mode == "test-lsh"){
-      this.testLSHPerformance()
+      this.testLSHPerformance(df)
     } else if(mode == "final") {
-      testFinalSelector()
+      testFinalSelector(df)
     } else {
-      doRELIEFComparison()
+      doRELIEFComparison(df)
     }
   }
   
   
-  def doRELIEFComparison() {
-    val rawDF = TestHelper.readCSVData(sqlContext, pathFile, firstHeader)
-    val df = preProcess(rawDF).select(clsLabel, inputLabel)
-    val allVectorsDense = true
-    df.show
+  def doRELIEFComparison(df: Dataset[_]) {
     
-    val origRDD = initRDD(df, allVectorsDense)
+    val origRDD = initRDD(df.toDF(), allVectorsDense = true)
     val rdd = origRDD.map {
       case Row(label: Double, features: Vector) =>
         LabeledPoint(label, features)
@@ -144,10 +148,10 @@ object MainMLlibTest {
     val nf = rdd.first.features.size
     val nelems = rdd.count()
     
-    val accMarginal = new VectorAccumulator(nf)
+    val accMarginal = new VectorAccumulator(nf, false)
     // Then, register it into spark context:
     rdd.context.register(accMarginal, "marginal")
-    val accJoint = new MatrixAccumulator(nf, nf)
+    val accJoint = new MatrixAccumulator(nf, nf, false)
     rdd.context.register(accJoint, "joint")
     val total = rdd.context.longAccumulator("total")
     println("# instances: " + rdd.count)
@@ -486,19 +490,23 @@ object MainMLlibTest {
     println("clslabel: " + clsLabel)
     
     // Assemble all input features
-    val featureAssembler = new VectorAssembler()
-      .setInputCols(newNames)
-      .setOutputCol(inputLabel)
-
-    var processedDF = featureAssembler.transform(cleanedDF)
-      .select(clsLabel, inputLabel)
-
+    var processedDF = if(newNames.size > 1){
+      val featureAssembler = new VectorAssembler()
+        .setInputCols(newNames)
+        .setOutputCol(inputLabel)
+      featureAssembler.transform(cleanedDF).select(clsLabel, inputLabel)
+    } else {
+      cleanedDF.select(clsLabel, inputLabel)
+    }
+    
     println("clsLabel: " + clsLabel)
     println("Columns: " + processedDF.columns.mkString(","))
     println("Schema: " + processedDF.schema.toString)
     println(processedDF.first.get(1))
       
-    if(discretize){      
+    if(discretize || (continuous && format == "libsvm")){ 
+      // Continuous data from LIBSVM has to discretized since
+      // ML does not allow fair normalization of sparse vectors
       val discretizer = new MDLPDiscretizer()
         .setMaxBins(15)
         .setMaxByPart(10000)
@@ -517,9 +525,11 @@ object MainMLlibTest {
         .setOutputCol("norm-" + inputLabel)
         .setWithStd(true)
         .setWithMean(true)
-
+      
+      val smodel = scaler.fit(processedDF)
+      println(smodel.mean)
+      processedDF = smodel.transform(processedDF)
       inputLabel = "norm-" + inputLabel
-      processedDF = scaler.fit(processedDF).transform(processedDF)
     }
     processedDF
   }
@@ -551,11 +561,7 @@ object MainMLlibTest {
     selector.fit(df)
   }
   
-  def testLSHPerformance() {
-    val rawDF = TestHelper.readCSVData(sqlContext, pathFile, firstHeader)
-    val df = preProcess(rawDF).select(clsLabel, inputLabel).cache
-    val allVectorsDense = true
-    df.show
+  def testLSHPerformance(df: Dataset[_]) {
     
     val nFeat = df.select(inputLabel).head().getAs[Vector](0).size
     val nelems = df.count()
@@ -594,11 +600,7 @@ object MainMLlibTest {
     
   }
   
-  def testFinalSelector() {
-    val rawDF = TestHelper.readCSVData(sqlContext, pathFile, firstHeader)
-    val df = preProcess(rawDF).select(clsLabel, inputLabel).repartition(nPartitions).cache
-    val allVectorsDense = true
-    df.show
+  def testFinalSelector(df: Dataset[_]) {
     
     val nFeat = df.select(inputLabel).head().getAs[Vector](0).size
     val nelems = df.count()
