@@ -44,7 +44,6 @@ import org.apache.spark.sql.types.FloatType
 import breeze.linalg.VectorBuilder
 import breeze.linalg.CSCMatrix
 import org.apache.spark.ml.linalg.SparseVector
-import breeze.collection.mutable.OpenAddressHashArray
 import scala.collection.mutable.HashMap
 import breeze.linalg.{Matrix => BM, Vector => BV, DenseMatrix => BDM, DenseVector => BDV, SparseVector => BSV}
 import breeze.generic.UFunc
@@ -195,7 +194,12 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val LSHmodel = brp.fit(dataset)
     
     val struct = dataset.schema.fields(dataset.schema.fieldIndex($(inputCol)))
-    val continuous = AttributeGroup.fromStructField(struct).attributes.get.exists { att => att.isNumeric }
+    val asd = AttributeGroup.fromStructField(struct).attributes
+    val continuous = AttributeGroup.fromStructField(struct).attributes match {
+      case Some(l) => l.exists { att => att.isNumeric }
+      case None => true
+    }
+    
     val modelDataset: DataFrame = if (!dataset.columns.contains(hashOutputCol)) {
         LSHmodel.transform(dataset)
       } else {
@@ -237,11 +241,14 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       }  
     
       // Index query objects and compute the table that indicates where are located its neighbors
-      val idxModelQuery = modelQuery.withColumn("UniqueID", monotonically_increasing_id)
+      val idxModelQuery = modelQuery.withColumn("UniqueID", monotonically_increasing_id).cache
+      val asd = idxModelQuery.head.getAs[WrappedArray[Vector]](hashOutputCol).array
+      idxModelQuery.show
+      println("Idx size: " + idxModelQuery.count())
       val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(idxModelQuery.select(
           col("UniqueID"), col($(inputCol)), col($(labelCol)), col(hashOutputCol)).collect())
           
-      val neighbors: RDD[(Long, Map[Short, Iterable[Int]])] = approxNNByPartition(modelDataset, 
+      val neighbors: RDD[(Long, Map[Short, Iterable[Int]])] = approxNNByPartition(idxModelQuery, 
           bFullQuery, LSHmodel, $(numNeighbors) * priorClass.size)
       
       val bNeighborsTable: Broadcast[Map[Long, Map[Short, Iterable[Int]]]] = 
@@ -249,10 +256,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       
       val (rawWeights: RDD[(Int, Float)], partialJoint, partialMarginal, partialCount, skipped) = 
         if(sparse) computeReliefWeightsSparse(
-            modelDataset.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
+            idxModelQuery.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
           topFeatures, priorClass, nFeat, nElems, continuous) else 
             computeReliefWeights(
-              modelDataset.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
+              idxModelQuery.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
           topFeatures, priorClass, nFeat, nElems, continuous)
       
       // Normalize previous results and return the best features

@@ -19,7 +19,7 @@ package org.apache.spark.ml.feature
 
 import scala.util.Random
 import org.apache.spark.ml.{Estimator, Model}
-import org.apache.spark.ml.linalg.{Vector, VectorUDT}
+import org.apache.spark.ml.linalg.{Vector, VectorUDT, Matrix}
 import org.apache.spark.ml.param.{IntParam, ParamValidators}
 import org.apache.spark.ml.param.shared.{HasInputCol, HasOutputCol}
 import org.apache.spark.ml.util._
@@ -30,6 +30,7 @@ import org.apache.spark.ml.linalg.Vectors
 import scala.collection.mutable.Queue
 import org.apache.spark.rdd.RDD
 import org.apache.spark.broadcast.Broadcast
+
 //import scala.collection.Map
 
 import scala.collection.immutable.Map
@@ -92,6 +93,13 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
    * The hash function of LSH, mapping an input feature vector to multiple hash vectors.
    * @return The mapping of LSH function.
    */
+  protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Matrix]]) => Array[Vector]
+  
+  
+  /**
+   * The hash function of LSH, mapping an input feature vector to multiple hash vectors.
+   * @return The mapping of LSH function.
+   */
   protected[ml] val hashFunction: Vector => Array[Vector]
 
   /**
@@ -111,6 +119,10 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
    * @return The distance between hash vectors x and y.
    */
   protected[ml] def hashDistance(x: Seq[Vector], y: Seq[Vector]): Double
+  
+  protected[ml] def getHashFunctions(): Array[Matrix]
+  
+  
   
   /**
    * Calculate the distance between two different hash Vectors, imposing a 
@@ -142,15 +154,14 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
 
   override def transform(dataset: Dataset[_]): DataFrame = {
     transformSchema(dataset.schema, logging = true)
-    val transformUDF = udf(hashFunction, DataTypes.createArrayType(new VectorUDT))
+    val bHashFunctions: Broadcast[Array[Matrix]] = dataset.sparkSession.sparkContext.broadcast(getHashFunctions())
+    val transformUDF = udf(multipleHashFunction(_: Vector, bHashFunctions), DataTypes.createArrayType(new VectorUDT))
     dataset.withColumn($(outputCol), transformUDF(dataset($(inputCol))))
   }
 
   override def transformSchema(schema: StructType): StructType = {
     validateAndTransformSchema(schema)
   }
-
-  
   
   // TODO: Fix the MultiProbe NN Search in SPARK-18454
   private[feature] def approxNearestNeighbors(
@@ -163,6 +174,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
       step: Int = 2): (Long, Dataset[_]) = {
     require(numNearestNeighbors > 0, "The number of nearest neighbors cannot be less than 1")
     // Get Hash Value of the key
+    
     val keyHash = hashFunction(key)
     val modelDataset: DataFrame = if (!dataset.columns.contains($(outputCol))) {
         transform(dataset)

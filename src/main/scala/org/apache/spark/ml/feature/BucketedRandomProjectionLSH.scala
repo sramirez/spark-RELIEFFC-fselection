@@ -18,10 +18,9 @@
 package org.apache.spark.ml.feature
 
 import scala.util.Random
-
 import breeze.linalg.normalize
+import breeze.numerics._
 import org.apache.hadoop.fs.Path
-
 import org.apache.spark.annotation.{Experimental, Since}
 import org.apache.spark.ml.linalg._
 import org.apache.spark.ml.param._
@@ -30,6 +29,7 @@ import org.apache.spark.ml.util._
 import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.broadcast.Broadcast
 
 /**
  * :: Experimental ::
@@ -74,22 +74,33 @@ class BucketedRandomProjectionLSHModel private[ml](
   extends LSHModel[BucketedRandomProjectionLSHModel] with BucketedRandomProjectionLSHParams {
 
   @Since("2.1.0")
-  override protected[ml] val hashFunction: Vector => Array[Vector] = {
-    key: Vector => {
-      val hashValues = randUnitVectors.map({
+  override protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Matrix]]) => Array[Vector] = {
+    (key: Vector, bRandUnitVectors: Broadcast[Array[Matrix]]) => {
+      val hashValues = bRandUnitVectors.value.map({
         randUnitVector => 
-          val ax = randUnitVector.multiply(key)
-          val sig = new Array[Double](ax.size)
-
-          ax.foreachActive((i, v) => {
-            sig(i) = math.floor((ax(i)) / $(bucketLength))
-          })
-          sig
+          randUnitVector.rowIter.map { row => 
+            math.floor(key.asBreeze.dot(row.asBreeze) / $(bucketLength))
+          }.toArray
       })
       // TODO: Output vectors of dimension numHashFunctions in SPARK-18450
       hashValues.map(Vectors.dense(_))
     }
   }
+  
+  override protected[ml] val hashFunction: Vector => Array[Vector] = {
+    key: Vector => {
+      val hashValues = randUnitVectors.map({
+        randUnitVector => 
+          randUnitVector.rowIter.map { row => 
+            math.floor(key.asBreeze.dot(row.asBreeze) / $(bucketLength))
+          }.toArray
+      })
+      // TODO: Output vectors of dimension numHashFunctions in SPARK-18450
+      hashValues.map(Vectors.dense(_))
+    }
+  }
+  
+  override protected[ml] val getHashFunctions = this.randUnitVectors
 
   @Since("2.1.0")
   override protected[ml] def keyDistance(x: Vector, y: Vector): Double = {

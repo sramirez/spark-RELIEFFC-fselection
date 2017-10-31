@@ -35,6 +35,7 @@ import org.apache.spark.ml.attribute.NominalAttribute
 import org.apache.spark.ml.attribute.Attribute
 import org.apache.spark.ml.util.MetadataUtils
 import org.apache.spark.sql.Dataset
+import org.apache.spark.ml.linalg.DenseMatrix
 
 
 /**
@@ -59,9 +60,9 @@ object MainMLlibTest {
   var nselect: Int = 10
   var seed = 12345678L
   var lowerFeatThreshold = 0.5
-  var numHashTables = 30
+  var numHashTables = 10
   var bucketWidth = 4
-  var signatureSize = 10
+  var signatureSize = 5
   var mode = "test-lsh"
   var percTest = 0.2f
   var batchSize = 0.25f
@@ -80,10 +81,13 @@ object MainMLlibTest {
     
     val initStartTime = System.nanoTime()
     
-    val conf = new SparkConf().setAppName("CollisionFS Test").setMaster("local[*]")
+    val conf = new SparkConf().setAppName("CollisionFS Test").setMaster("local[*]").set("spark.driver.memory", "16g").set("spark.executor.memory", "16g")
     val sc = new SparkContext(conf)
     sqlContext = new SQLContext(sc)
-
+    
+    //val rand = new java.util.Random(seed)
+    //Array.fill(5) { DenseMatrix.randn(5, 30000000, rand) }
+    //val asd =  DenseMatrix.randn(5, 30000000, rand)
     println("Usage: MLlibTest --train-file=\"hdfs://blabla\" --nselect=10 --npart=1 --continuous=false --k=5 --ntop=10 --discretize=false --padded=2 --class-last=true --header=false")
         
     // Create a table of parameters (parsing)
@@ -118,10 +122,12 @@ object MainMLlibTest {
     
     println("Params used: " +  params.mkString("\n"))
     
-    val rawDF = TestHelper.readData(sqlContext, pathFile, firstHeader, format)
+    val rawDF = TestHelper.readData(sqlContext, pathFile, firstHeader, format).repartition(nPartitions).cache
     rawDF.show
     val df = preProcess(rawDF).select(clsLabel, inputLabel).cache
     df.show
+    rawDF.unpersist()
+
     
     if(mode == "test-lsh"){
       this.testLSHPerformance(df)
@@ -139,7 +145,7 @@ object MainMLlibTest {
     val rdd = origRDD.map {
       case Row(label: Double, features: Vector) =>
         LabeledPoint(label, features)
-    }.repartition(nPartitions).cache //zipwithUniqueIndexs
+    }.cache //zipwithUniqueIndexs
     
     //Dataframe version
     val inputData = sqlContext.createDataFrame(origRDD, df.schema).cache()
