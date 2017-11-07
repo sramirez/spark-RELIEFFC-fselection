@@ -194,7 +194,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val LSHmodel = brp.fit(dataset)
     
     val struct = dataset.schema.fields(dataset.schema.fieldIndex($(inputCol)))
-    val asd = AttributeGroup.fromStructField(struct).attributes
     val continuous = AttributeGroup.fromStructField(struct).attributes match {
       case Some(l) => l.exists { att => att.isNumeric }
       case None => true
@@ -206,7 +205,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         dataset.toDF()
       }
     val weights = Array.fill((1 / $(batchSize)).toInt)($(estimationRatio) * $(batchSize))
-    modelDataset.show()
     val batches = modelDataset.randomSplit(weights, $(seed))
     
     // Get some basic information about the dataset
@@ -221,7 +219,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         .mapValues(v => (v.toDouble / nElems).toFloat)
         .map(identity).toMap
         
-      val schema = new StructType()
+    val schema = new StructType()
             .add(StructField("id2", IntegerType, true))
             .add(StructField("score2", FloatType, true))
     var featureWeights: BV[Float] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
@@ -242,9 +240,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
       // Index query objects and compute the table that indicates where are located its neighbors
       val idxModelQuery = modelQuery.withColumn("UniqueID", monotonically_increasing_id).cache
-      val asd = idxModelQuery.head.getAs[WrappedArray[Vector]](hashOutputCol).array
-      idxModelQuery.show
-      println("Idx size: " + idxModelQuery.count())
       val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(idxModelQuery.select(
           col("UniqueID"), col($(inputCol)), col($(labelCol)), col(hashOutputCol)).collect())
           
@@ -253,7 +248,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       
       val bNeighborsTable: Broadcast[Map[Long, Map[Short, Iterable[Int]]]] = 
           sc.broadcast(neighbors.collectAsMap().toMap)
-      
+          
       val (rawWeights: RDD[(Int, Float)], partialJoint, partialMarginal, partialCount, skipped) = 
         if(sparse) computeReliefWeightsSparse(
             idxModelQuery.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
@@ -263,18 +258,19 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           topFeatures, priorClass, nFeat, nElems, continuous)
       
       // Normalize previous results and return the best features
-      results(i) = spark.createDataFrame(rawWeights.map{ case(k,v) => Row(k,v) }, schema).cache()
-      val normalized = normalizeRankingDF(results(i))
-      val quantile = normalized.stat.approxQuantile("score2", Array($(lowerFeatureThreshold)), 0.05)(0)
-      topFeatures = normalized.filter(normalized.col("score2").geq(quantile)).collect().map { 
-        case Row(id: Int, score: Float) => id -> score}.toMap
+      results(i) = spark.createDataFrame(rawWeights.map{ case(k,v) => Row(k,v) }, schema).cache()      
+      if(results(i).count > 0){ // call the action required to persist data
+        val normalized = normalizeRankingDF(results(i))
+        val quantile = normalized.stat.approxQuantile("score2", Array($(lowerFeatureThreshold)), 0.05)(0)
+        topFeatures = normalized.filter(normalized.col("score2").geq(quantile)).collect().map { 
+            case Row(id: Int, score: Float) => id -> score}.toMap
+      }
         
       // Partial statistics for redundancy and others
       total += partialCount.value
       jointMatrix += partialJoint.value
       marginalVector += partialMarginal.value
       println("# omitted instances in this step: " + skipped)
-      finalWeights.show
         
       if(i > 1){
         finalWeights = finalWeights
@@ -284,22 +280,22 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         finalWeights = results(0).selectExpr("id2 as id", "score2 as score")
       } 
         
-      bNeighborsTable.destroy(); bFullQuery.destroy()
+      // Free some resources
+      bNeighborsTable.destroy(); bFullQuery.destroy(); idxModelQuery.unpersist();
     }
     
     finalWeights.cache()
-    finalWeights.show
     val stats = finalWeights.agg(max("score"), min("score")).head()
     val maxRelief = stats.getAs[Float](0); val minRelief = stats.getAs[Float](1)
     val normalizeUDF = udf((x: Float) => (x - minRelief) / (maxRelief - minRelief), DataTypes.FloatType)
     finalWeights = finalWeights.withColumn("norm-score", normalizeUDF(col("score")))
-    finalWeights.show()
+    finalWeights.show
     
     // Unpersist partial results
     (0 until batches.size).foreach(i => results(i).unpersist())
 
     // normalized redundancy
-    val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat, continuous)
+    val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat, continuous, sparse)
     val rddFinalWeights = finalWeights.rdd.map{ case Row(k: Int, _, normScore: Float) => (k, normScore)}
     val (reliefCol, relief) = selectFeatures(rddFinalWeights, redundancyMatrix)
     val outRC = reliefCol.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
@@ -446,7 +442,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
      // Initialize accumulators for RELIEF+Collision computation
     val sc = modelDataset.sparkSession.sparkContext
     val accMarginal = new VectorAccumulator(nFeat, sparse = true); sc.register(accMarginal, "marginal")
-    val accJoint = new MatrixAccumulator(nFeat, nFeat, sparse = true);  sc.register(accJoint, "joint")
+    val accJoint = new MatrixAccumulator(nFeat, nFeat, sparse = true); sc.register(accJoint, "joint")
     val totalInteractions = sc.longAccumulator("totalInteractions")
     val omittedInstances = sc.longAccumulator("omittedInstances")
     val label2Num = priorClass.zipWithIndex.map{case (k, v) => k._1 -> v.toShort}
@@ -464,7 +460,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         val marginal = new VectorBuilder[Double](nFeat)
         val joint = new CSCMatrix.Builder[Double](rows=nFeat, cols=nFeat)
         // Builder better than hash, we need to reduce communication overhead
-        val reliefWeights = new VectorBuilder[Double](nFeat) 
+        val reliefWeights = new VectorBuilder[Float](nFeat) 
         val r = new scala.util.Random($(seed))
         
         query.map{ case Row(qid: Long, qinput: SparseVector, qlabel: Double, _) =>
@@ -472,7 +468,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             val rnumber = r.nextFloat()
             val condition = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
             val featThreshold = lowerFeatureTh + rnumber * lowerFeatureTh
-            val condition2 = bTF.value.mapValues{ _ >= featThreshold}
+            val condition2 = bTF.value.mapValues{ _ >= featThreshold }
             val localRelief = new HashMap[Int, Array[Double]]
             val classCounter = BDV.zeros[Long](label2Num.size)
         
@@ -558,9 +554,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   }
   
   private def computeRedudancy(rawJoint: BM[Double], rawMarginal: BV[Double], 
-      total: Long, nFeat: Int, isCont: Boolean) = {
+      total: Long, nFeat: Int, isCont: Boolean, isSparse: Boolean) = {
     // Now compute redundancy based on collisions and normalize it
-    val factor = if(isCont) 1.0 else Double.MinPositiveValue
+    val factor = if(isCont && !isSparse) 1.0 else Double.MinPositiveValue
     val marginal = rawMarginal.mapActiveValues(_ /  (total * factor))
     
     var maxRed = Double.NegativeInfinity; var minRed = Double.PositiveInfinity
@@ -661,9 +657,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         case bsm: CSCMatrix[Double] => 
           val begin = bsm.colPtrs(selected.head.feat)
           val end = bsm.colPtrs(selected.head.feat + 1)
-          (begin until end).foreach{ k =>
+          bsm.rowIndices.slice(begin, end).foreach{ k =>
             if(pool(k).valid)
-              pool(k).update(bsm.data(bsm.rowIndices(k)).toFloat)
+              pool(k).update(bsm.data(k).toFloat)
           }
         case bdm: BDM[Double] =>
           (0 until pool.size).foreach{ k =>            

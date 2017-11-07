@@ -510,7 +510,8 @@ object MainMLlibTest {
     println("Schema: " + processedDF.schema.toString)
     println(processedDF.first.get(1))
       
-    if(discretize || (continuous && format == "libsvm")){ 
+    //if(discretize || (continuous && format == "libsvm")){ 
+    if(discretize) {
       // Continuous data from LIBSVM has to discretized since
       // ML does not allow fair normalization of sparse vectors
       val discretizer = new MDLPDiscretizer()
@@ -525,7 +526,7 @@ object MainMLlibTest {
       val model = discretizer.fit(processedDF)
       processedDF = model.transform(processedDF)
       continuous = false
-    } else if(continuous) {
+    } else if(continuous && format != "libsvm") {
       val scaler = new StandardScaler()
         .setInputCol(inputLabel)
         .setOutputCol("norm-" + inputLabel)
