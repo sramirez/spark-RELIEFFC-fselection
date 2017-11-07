@@ -198,12 +198,14 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       case Some(l) => l.exists { att => att.isNumeric }
       case None => true
     }
-    
+    dataset.show()
+    val asd = LSHmodel.randUnitVectors
     val modelDataset: DataFrame = if (!dataset.columns.contains(hashOutputCol)) {
         LSHmodel.transform(dataset)
       } else {
         dataset.toDF()
       }
+    modelDataset.show()
     val weights = Array.fill((1 / $(batchSize)).toInt)($(estimationRatio) * $(batchSize))
     val batches = modelDataset.randomSplit(weights, $(seed))
     
@@ -237,7 +239,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       } else {
         query.toDF()
       }  
-    
+      modelQuery.show
       // Index query objects and compute the table that indicates where are located its neighbors
       val idxModelQuery = modelQuery.withColumn("UniqueID", monotonically_increasing_id).cache
       val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(idxModelQuery.select(
@@ -258,9 +260,11 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           topFeatures, priorClass, nFeat, nElems, continuous)
       
       // Normalize previous results and return the best features
-      results(i) = spark.createDataFrame(rawWeights.map{ case(k,v) => Row(k,v) }, schema).cache()      
+      results(i) = spark.createDataFrame(rawWeights.map{ case(k,v) => Row(k,v) }, schema).cache()   
+      results(i).show
       if(results(i).count > 0){ // call the action required to persist data
         val normalized = normalizeRankingDF(results(i))
+        normalized.show
         val quantile = normalized.stat.approxQuantile("score2", Array($(lowerFeatureThreshold)), 0.05)(0)
         topFeatures = normalized.filter(normalized.col("score2").geq(quantile)).collect().map { 
             case Row(id: Int, score: Float) => id -> score}.toMap
@@ -274,7 +278,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         
       if(i > 1){
         finalWeights = finalWeights
-          .join(results(i), finalWeights("id") === results(i)("id2"))
+          .join(results(i), finalWeights("id") === results(i)("id2"), "full_outer")
           .selectExpr("id", "score + score2 as score")
       } else {
         finalWeights = results(0).selectExpr("id2 as id", "score2 as score")
@@ -523,7 +527,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                           auxCollisioned += index
                         }
                        }
-                    }
+                    } 
                   }  
                 } else {
                   omittedInstances.add(1)
@@ -534,7 +538,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
          val denom = 1 - priorClass.get(qlabel).get
          localRelief.foreach { case (feat, v) =>
            val score = v.zipWithIndex.map{ case(value, cls) =>
-             if(cls != qlabel){
+             if(classCounter(cls) == 0) {
+               0.0f
+             }else if(cls != qlabel){
                ((idxPriorClass.get(cls).get / denom) * value / classCounter(cls)).toFloat 
              } else {
                (-value / classCounter(cls)).toFloat

@@ -74,12 +74,12 @@ class BucketedRandomProjectionLSHModel private[ml](
   extends LSHModel[BucketedRandomProjectionLSHModel] with BucketedRandomProjectionLSHParams {
 
   @Since("2.1.0")
-  override protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Matrix]]) => Array[Vector] = {
-    (key: Vector, bRandUnitVectors: Broadcast[Array[Matrix]]) => {
+  override protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Matrix]], Double) => Array[Vector] = {
+    (key: Vector, bRandUnitVectors: Broadcast[Array[Matrix]], bucketLength: Double) => {
       val hashValues = bRandUnitVectors.value.map({
         randUnitVector => 
           randUnitVector.rowIter.map { row => 
-            math.floor(key.asBreeze.dot(row.asBreeze) / $(bucketLength))
+            math.floor(key.asBreeze.dot(row.asBreeze) / bucketLength)
           }.toArray
       })
       // TODO: Output vectors of dimension numHashFunctions in SPARK-18450
@@ -100,7 +100,9 @@ class BucketedRandomProjectionLSHModel private[ml](
     }
   }
   
-  override protected[ml] val getHashFunctions = this.randUnitVectors
+  override protected[ml] def getHashFunctions() = this.randUnitVectors
+  
+  override protected[ml] def getBL() = $(bucketLength)
 
   @Since("2.1.0")
   override protected[ml] def keyDistance(x: Vector, y: Vector): Double = {

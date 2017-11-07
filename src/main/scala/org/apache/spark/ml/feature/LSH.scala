@@ -91,7 +91,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
    * The hash function of LSH, mapping an input feature vector to multiple hash vectors.
    * @return The mapping of LSH function.
    */
-  protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Matrix]]) => Array[Vector]
+  protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Matrix]], Double) => Array[Vector]
   
   
   /**
@@ -119,6 +119,8 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
   protected[ml] def hashDistance(x: Seq[Vector], y: Seq[Vector]): Double
   
   protected[ml] def getHashFunctions(): Array[Matrix]
+  
+  protected[ml] def getBL(): Double
   
   
   
@@ -153,7 +155,9 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
   override def transform(dataset: Dataset[_]): DataFrame = {
     transformSchema(dataset.schema, logging = true)
     val bHashFunctions: Broadcast[Array[Matrix]] = dataset.sparkSession.sparkContext.broadcast(getHashFunctions())
-    val transformUDF = udf(multipleHashFunction(_: Vector, bHashFunctions), DataTypes.createArrayType(new VectorUDT))
+    val bucketLength = this.getBL()
+    val bMultipleHF = dataset.sparkSession.sparkContext.broadcast(multipleHashFunction)
+    val transformUDF = udf(bMultipleHF.value(_: Vector, bHashFunctions, bucketLength), DataTypes.createArrayType(new VectorUDT))
     dataset.withColumn($(outputCol), transformUDF(dataset($(inputCol))))
   }
 

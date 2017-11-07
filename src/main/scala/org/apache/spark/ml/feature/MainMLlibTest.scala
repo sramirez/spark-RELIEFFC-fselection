@@ -114,8 +114,8 @@ object MainMLlibTest {
     numHashTables = params.getOrElse("numHashTables", "10").toInt
     bucketWidth = params.getOrElse("bucketWidth", "12").toInt
     signatureSize = params.getOrElse("signatureSize", "5").toInt
-    batchSize = params.getOrElse("batchSize", "0.25f").toFloat
-    estimationRatio = params.getOrElse("estimationRatio", "1.0f").toFloat
+    batchSize = params.getOrElse("batchSize", "0.5f").toFloat
+    estimationRatio = params.getOrElse("estimationRatio", "0.5f").toFloat
     queryStep = params.getOrElse("queryStep", "2").toInt    
     mode = params.getOrElse("mode", "final")
     format = params.getOrElse("format", "csv")
