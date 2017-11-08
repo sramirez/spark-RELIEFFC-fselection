@@ -158,7 +158,9 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
     val bucketLength = this.getBL()
     val bMultipleHF = dataset.sparkSession.sparkContext.broadcast(multipleHashFunction)
     val transformUDF = udf(bMultipleHF.value(_: Vector, bHashFunctions, bucketLength), DataTypes.createArrayType(new VectorUDT))
-    dataset.withColumn($(outputCol), transformUDF(dataset($(inputCol))))
+    val transformed = dataset.withColumn($(outputCol), transformUDF(dataset($(inputCol))))
+    bMultipleHF.destroy()
+    transformed
   }
 
   override def transformSchema(schema: StructType): StructType = {

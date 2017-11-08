@@ -136,8 +136,8 @@ private[feature] trait ReliefFRSelectorParams extends Params
   final val queryStep: IntParam = new IntParam(this, "queryStep", "", ParamValidators.gtEq(1))
   setDefault(queryStep -> 2)  
   
-  final val lowerFeatureThreshold: DoubleParam = new DoubleParam(this, "lowerFeatureThreshold", "", ParamValidators.inRange(0,1))
-  setDefault(lowerFeatureThreshold -> 0.5)
+  final val lowerFeatureThreshold: DoubleParam = new DoubleParam(this, "lowerFeatureThreshold", "", ParamValidators.gtEq(1))
+  setDefault(lowerFeatureThreshold -> 3)
   
   final val redundancyRemoval: BooleanParam = new BooleanParam(this, "redundancyRemoval", "")
   setDefault(redundancyRemoval -> true)
@@ -210,12 +210,13 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     // Get some basic information about the dataset
     val sc = modelDataset.sparkSession.sparkContext
+    val bLSHModel = sc.broadcast(LSHmodel)
     val spark = modelDataset.sparkSession.sqlContext
-    
     val nElems = modelDataset.count()
     val first = modelDataset.head().getAs[Vector]($(inputCol))
     val sparse = first.isInstanceOf[SparseVector]
     val nFeat = first.size
+    val probQuantile = $(lowerFeatureThreshold) * $(numTopFeatures) / nFeat.toDouble
     val priorClass = modelDataset.select($(labelCol)).rdd.map{ case Row(label: Double) => label }
         .countByValue()
         .mapValues(v => (v.toDouble / nElems).toFloat)
@@ -246,7 +247,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           col("UniqueID"), col($(inputCol)), col($(labelCol)), col(hashOutputCol)).collect())
           
       val neighbors: RDD[(Long, Map[Short, Iterable[Int]])] = approxNNByPartition(idxModelQuery, 
-          bFullQuery, LSHmodel, $(numNeighbors) * priorClass.size)
+          bFullQuery, bLSHModel, $(numNeighbors) * priorClass.size, hashOutputCol)
       
       val bNeighborsTable: Broadcast[Map[Long, Map[Short, Iterable[Int]]]] = 
           sc.broadcast(neighbors.collectAsMap().toMap)
@@ -261,27 +262,30 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       
       // Normalize previous results and return the best features
       results(i) = spark.createDataFrame(rawWeights.map{ case(k,v) => Row(k,v) }, schema).cache()   
-      results(i).show
       if(results(i).count > 0){ // call the action required to persist data
         val normalized = normalizeRankingDF(results(i))
-        normalized.show
-        val quantile = normalized.stat.approxQuantile("score2", Array($(lowerFeatureThreshold)), 0.05)(0)
+        val quantile = normalized.stat.approxQuantile("score2", Array(probQuantile), 0.05)(0)
         topFeatures = normalized.filter(normalized.col("score2").geq(quantile)).collect().map { 
             case Row(id: Int, score: Float) => id -> score}.toMap
       }
         
       // Partial statistics for redundancy and others
-      total += partialCount.value
-      jointMatrix += partialJoint.value
-      marginalVector += partialMarginal.value
+      total += partialCount.value      
+      jointMatrix = jointMatrix match {
+        case jm: CSCMatrix[Double] => jm += partialJoint.value.asInstanceOf[CSCMatrix[Double]]
+        case dm: BDM[Double] => dm += partialJoint.value.asInstanceOf[BDM[Double]]
+      }
+      marginalVector = marginalVector match {
+        case sv: BSV[Double] => sv += partialMarginal.value.asInstanceOf[BSV[Double]]
+        case dv: BDV[Double] => dv += partialMarginal.value
+      }
       println("# omitted instances in this step: " + skipped)
         
-      if(i > 1){
-        finalWeights.show()
+      if(i > 0){
         finalWeights = finalWeights
           .join(results(i), finalWeights("id") === results(i)("id2"), "full_outer")
-          .selectExpr("id", "score + score2 as score")
-        finalWeights.show()
+          .na.fill(0, Seq("id", "id2", "score", "score2"))
+          .selectExpr("greatest(id,id2) as id", "score + score2 as score")
       } else {
         finalWeights = results(0).selectExpr("id2 as id", "score2 as score")
       } 
@@ -291,6 +295,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     }
     
     finalWeights.cache()
+    val nWeights = finalWeights.count()
     val stats = finalWeights.agg(max("score"), min("score")).head()
     val maxRelief = stats.getAs[Float](0); val minRelief = stats.getAs[Float](1)
     val normalizeUDF = udf((x: Float) => (x - minRelief) / (maxRelief - minRelief), DataTypes.FloatType)
@@ -299,6 +304,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     // Unpersist partial results
     (0 until batches.size).foreach(i => results(i).unpersist())
+    bLSHModel.destroy()
 
     // normalized redundancy
     val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat, continuous, sparse)
@@ -318,6 +324,47 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       val maxRelief = scores.getAs[Float](1); val minRelief = scores.getAs[Float](0)
       val normalizeUDF = udf((x: Float) => (x - minRelief) / (maxRelief - minRelief), DataTypes.FloatType)
       partialWeights.withColumn("score2", normalizeUDF(col("score2")))
+  }  
+  // TODO: Fix the MultiProbe NN Search in SPARK-18454
+  private def approxNNByPartition(
+      modelDataset: Dataset[_],
+      bModelQuery: Broadcast[Array[Row]],
+      model: Broadcast[BucketedRandomProjectionLSHModel],
+      k: Int,
+      hashCol: String): RDD[(Long, Map[Short, Iterable[Int]])] = {
+    
+    case class Localization(part: Short, index: Int)
+    val sc = modelDataset.sparkSession.sparkContext
+    
+    val neighbors = modelDataset.select($(inputCol), hashCol).rdd.mapPartitionsWithIndex { 
+        case (pindex, it) => 
+          // Initialize the map composed by the priority queue and the central element's ID
+          val query = bModelQuery.value // Fields: "UniqueID", $(inputCol), $(labelCol), "hashOutputCol"
+          val ordering = Ordering[Float].on[(Float, Localization)](-_._1)   
+          val neighbors = query.map { case Row(id: Long, _, _, _) => 
+            id -> new BoundedPriorityQueue[(Float, Localization)](k)(ordering)
+          }   
+      
+          var i = 0
+          // First iterate over the local elements, and then over the sampled set (also called query set).
+          while(it.hasNext) {
+            val Row(inputNeig: Vector, hashNeig: WrappedArray[Vector]) = it.next
+            (0 until query.size).foreach { j => 
+               val Row(_, inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
+               val hdist = model.value.hashDistance(hashQuery.array, hashNeig.array)
+               if(hdist < Double.PositiveInfinity) {
+                 val distance = model.value.keyDistance(inputQuery, inputNeig)
+                 neighbors(j)._2 += distance.toFloat -> Localization(pindex.toShort, i)
+               }
+                 
+            }
+            i += 1              
+          }            
+          neighbors.toIterator
+      }.reduceByKey(_ ++= _).mapValues(
+          _.map(l => Localization.unapply(l._2).get).groupBy(_._1).mapValues(_.map(_._2)).map(identity)) 
+      // map(identity) needed to fix bug: https://issues.scala-lang.org/browse/SI-7005
+    neighbors
   }
   
   private def computeReliefWeights (
@@ -490,7 +537,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                     classCounter(labelIndex) += 1
                     
                     val v1Indices = qinput.indices; val nnzv1 = v1Indices.length; var kv1 = 0
-                    println("v1Indices: " + v1Indices.mkString(","))
                     val v2Indices = ninput.indices; val nnzv2 = v2Indices.length; var kv2 = 0
                     while (kv1 < nnzv1 || kv2 < nnzv2) {
                       var score = 0.0; var index = kv1
@@ -503,7 +549,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                         score = qinput.values(kv1) - ninput.values(kv2); kv1 += 1; kv2 += 1; index = kv1
                       }
                       val fdistance = math.abs(score)
-                      println("Computed score: " + score)
                       //// RELIEF Computations
                       val updateV = localRelief.getOrElse(index, Array.fill(label2Num.size)(0.0d))
                       updateV(labelIndex) += fdistance 
@@ -533,7 +578,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                     } 
                   }  
                 } else {
-                  omittedInstances.add(1)
+                  omittedInstances.add(1L)
                 }
               case None =>
                 System.err.println("Instance does not found in the table")
@@ -549,22 +594,14 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                (-value / classCounter(cls)).toFloat
              }
            }.sum
-           println("Updating weights")
            reliefWeights.add(feat, score)
          }
          totalInteractions.add(classCounter.sum)
       }
       // update accumulated matrices  
-      println("Completed, building the sparse vector")
-      println("Size marginal: " +  marginal.activeSize)
-      println("Size marginal: " +  joint.activeSize)
-      println("Size marginal: " +  reliefWeights.activeSize)
-      
       accMarginal.add(marginal.toSparseVector)
       accJoint.add(joint.result)
-      println("Built!")
       reliefWeights.toSparseVector.activeIterator
-      
     }.reduceByKey(_ + _)
      
     (rawReliefWeights, accJoint, accMarginal, totalInteractions, omittedInstances)
@@ -610,50 +647,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         redm.mapValues { e => (e - minRed) / (maxRed - minRed) }   
     }
   }
-  
-  // TODO: Fix the MultiProbe NN Search in SPARK-18454
-  private def approxNNByPartition(
-      modelDataset: Dataset[_],
-      bModelQuery: Broadcast[Array[Row]],
-      model: LSHModel[_],
-      k: Int): RDD[(Long, Map[Short, Iterable[Int]])] = {
-    
-    case class Localization(part: Short, index: Int)
-    val sc = modelDataset.sparkSession.sparkContext
-    val qs = $(queryStep)
-    val hashDistance = sc.broadcast(model.hashThresholdedDistance(_: Seq[Vector], _: Seq[Vector], qs))
-    val realDistance = sc.broadcast(model.keyDistance(_: Vector, _: Vector))
-    
-    val neighbors = modelDataset.select($(inputCol), model.getOutputCol).rdd.mapPartitionsWithIndex { 
-        case (pindex, it) => 
-          // Initialize the map composed by the priority queue and the central element's ID
-          val query = bModelQuery.value // Fields: "UniqueID", $(inputCol), $(labelCol), "hashOutputCol"
-          val ordering = Ordering[Float].on[(Float, Localization)](-_._1)   
-          val neighbors = query.map { case Row(id: Long, _, _, _) => 
-            id -> new BoundedPriorityQueue[(Float, Localization)](k)(ordering)
-          }   
-      
-          var i = 0
-          // First iterate over the local elements, and then over the sampled set (also called query set).
-          while(it.hasNext) {
-            val Row(inputNeig: Vector, hashNeig: WrappedArray[Vector]) = it.next
-            (0 until query.size).foreach { j => 
-               val Row(_, inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
-               val hdist = hashDistance.value(hashQuery.array, hashNeig.array)
-               if(hdist < Double.PositiveInfinity) {
-                 val distance = realDistance.value(inputQuery, inputNeig)
-                 neighbors(j)._2 += distance.toFloat -> Localization(pindex.toShort, i)
-               }
-                 
-            }
-            i += 1              
-          }            
-          neighbors.toIterator
-      }.reduceByKey(_ ++= _).mapValues(
-          _.map(l => Localization.unapply(l._2).get).groupBy(_._1).mapValues(_.map(_._2)).map(identity)) 
-      // map(identity) needed to fix bug: https://issues.scala-lang.org/browse/SI-7005
-    neighbors
-  }
+
   
    def selectFeatures(reliefRanking: RDD[(Int, Float)],
       redundancyMatrix: BM[Double], nFeat: Int): (Seq[F], Seq[F]) = {

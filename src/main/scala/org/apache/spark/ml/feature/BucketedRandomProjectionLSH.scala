@@ -19,6 +19,7 @@ package org.apache.spark.ml.feature
 
 import scala.util.Random
 import breeze.linalg.normalize
+import breeze.linalg.{Vector => BV, DenseVector => BDV, SparseVector => BSV}
 import breeze.numerics._
 import org.apache.hadoop.fs.Path
 import org.apache.spark.annotation.{Experimental, Since}
@@ -76,10 +77,16 @@ class BucketedRandomProjectionLSHModel private[ml](
   @Since("2.1.0")
   override protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Matrix]], Double) => Array[Vector] = {
     (key: Vector, bRandUnitVectors: Broadcast[Array[Matrix]], bucketLength: Double) => {
+      val sparse = key.asBreeze match { case _: BDV[_] => false; case _: BSV[_] => true}
       val hashValues = bRandUnitVectors.value.map({
         randUnitVector => 
           randUnitVector.rowIter.map { row => 
-            math.floor(key.asBreeze.dot(row.asBreeze) / bucketLength)
+            val product = if(sparse){
+              key.asBreeze.asInstanceOf[BSV[Double]].dot(row.asBreeze.asInstanceOf[BSV[Double]])
+            } else {
+              key.asBreeze.dot(row.asBreeze)
+            }
+            math.floor(product / bucketLength)
           }.toArray
       })
       // TODO: Output vectors of dimension numHashFunctions in SPARK-18450

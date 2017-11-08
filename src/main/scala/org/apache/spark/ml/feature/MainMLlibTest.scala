@@ -60,7 +60,7 @@ object MainMLlibTest {
   var nselect: Int = 10
   var seed = 12345678L
   var lowerFeatThreshold = 0.5
-  var numHashTables = 10
+  var numHashTables = 100
   var bucketWidth = 4
   var signatureSize = 5
   var mode = "test-lsh"
@@ -110,12 +110,12 @@ object MainMLlibTest {
     nselect = params.getOrElse("nselect", "10").toInt
     continuous = params.getOrElse("continuous", "true").toBoolean
     mrmr = params.getOrElse("mrmr", "false").toBoolean
-    lowerFeatThreshold = params.getOrElse("lowerFeatThreshold", "0.5").toFloat
-    numHashTables = params.getOrElse("numHashTables", "2").toInt
+    lowerFeatThreshold = params.getOrElse("lowerFeatThreshold", "3.0").toFloat
+    numHashTables = params.getOrElse("numHashTables", "10").toInt
     bucketWidth = params.getOrElse("bucketWidth", "12").toInt
-    signatureSize = params.getOrElse("signatureSize", "2").toInt
+    signatureSize = params.getOrElse("signatureSize", "3").toInt
     batchSize = params.getOrElse("batchSize", "0.5f").toFloat
-    estimationRatio = params.getOrElse("estimationRatio", "0.5f").toFloat
+    estimationRatio = params.getOrElse("estimationRatio", "1.0f").toFloat
     queryStep = params.getOrElse("queryStep", "2").toInt    
     mode = params.getOrElse("mode", "final")
     format = params.getOrElse("format", "csv")
