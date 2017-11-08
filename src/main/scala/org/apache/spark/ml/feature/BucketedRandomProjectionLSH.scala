@@ -175,19 +175,22 @@ class BucketedRandomProjectionLSH(override val uid: String)
 
   @Since("2.1.0")
   override protected[this] def createRawLSHModel(
-    projectedDim: Int, originalDim: Int, sparseProjection: Boolean): BucketedRandomProjectionLSHModel = {
-    val rand = new java.util.Random($(seed))
-    val randUnitVectors: Array[Matrix] = {
-      Array.fill($(numHashTables)) {
-        if(sparseProjection) {
-          val density = 1 / math.sqrt(originalDim)
-          SparseMatrix.sprandn(projectedDim, originalDim, density, rand)
-        } else {
-          DenseMatrix.randn(projectedDim, originalDim, rand)
-        }        
+    projectedDim: Int, 
+    originalDim: Int, 
+    sparseProjection: Boolean, 
+    sparseSpeedup: Double = 3): BucketedRandomProjectionLSHModel = {
+      val rand = new java.util.Random($(seed))
+      val randUnitVectors: Array[Matrix] = {
+        Array.fill($(numHashTables)) {
+          if(sparseProjection) {
+            val density = 1 / math.sqrt(sparseSpeedup)
+            SparseMatrix.sprandn(projectedDim, originalDim, density, rand)
+          } else {
+            DenseMatrix.randn(projectedDim, originalDim, rand)
+          }        
+        }
       }
-    }
-    new BucketedRandomProjectionLSHModel(uid, randUnitVectors)
+      new BucketedRandomProjectionLSHModel(uid, randUnitVectors)
   }
 
   @Since("2.1.0")

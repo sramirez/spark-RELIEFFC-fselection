@@ -25,12 +25,15 @@ class VectorAccumulator(val rows: Int, sparse: Boolean) extends AccumulatorV2[Ve
   def add(v: Vector[Double]): Unit = {
     if(isZero) 
       zero = false
-    accVector += v
+    accVector = accVector match {
+      case sv: SparseVector[Double] => sv += v.asInstanceOf[SparseVector[Double]]
+      case dv: DenseVector[Double] => dv += v
+    }
   }
   
   def isZero(): Boolean = zero
   
-  def merge(other: AccumulatorV2[Vector[Double], Vector[Double]]): Unit = accVector += other.value
+  def merge(other: AccumulatorV2[Vector[Double], Vector[Double]]): Unit = add(other.value)
   
   def value: Vector[Double] = accVector
   

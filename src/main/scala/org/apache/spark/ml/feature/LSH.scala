@@ -400,7 +400,7 @@ private[ml] abstract class LSH[T <: LSHModel[T]]
    * @param inputDim The dimension of the input dataset
    * @return A new LSHModel instance without any params
    */
-  protected[this] def createRawLSHModel(projectedDim: Int, originalDim: Int, isSparse: Boolean): T
+  protected[this] def createRawLSHModel(projectedDim: Int, originalDim: Int, isSparse: Boolean, sparseSpeedup: Double): T
 
   override def fit(dataset: Dataset[_]): T = {
     transformSchema(dataset.schema, logging = true)
@@ -408,7 +408,7 @@ private[ml] abstract class LSH[T <: LSHModel[T]]
     val inputDim = first.size
     val isSparse = first.isInstanceOf[SparseVector]
     
-    val model = createRawLSHModel($(signatureSize), inputDim, isSparse).setParent(this)
+    val model = createRawLSHModel($(signatureSize), inputDim, isSparse, sparseSpeedup = inputDim).setParent(this)
     copyValues(model)
   }
   

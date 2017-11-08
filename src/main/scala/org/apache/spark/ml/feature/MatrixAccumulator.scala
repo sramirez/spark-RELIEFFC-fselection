@@ -25,12 +25,15 @@ class MatrixAccumulator(val rows: Int, val cols: Int, sparse: Boolean) extends A
   def add(v: Matrix[Double]): Unit = {
     if(isZero) 
       zero = false
-    accMatrix += v
+    accMatrix = accMatrix match {
+      case bsm: CSCMatrix[Double] => bsm += v.asInstanceOf[CSCMatrix[Double]]
+      case dsm: DenseMatrix[Double] => dsm += v
+    }
   }
   
   def isZero(): Boolean = zero
   
-  def merge(other: AccumulatorV2[Matrix[Double], Matrix[Double]]): Unit = accMatrix += other.value
+  def merge(other: AccumulatorV2[Matrix[Double], Matrix[Double]]): Unit = add(other.value)
   
   def value: Matrix[Double] = accMatrix
   
