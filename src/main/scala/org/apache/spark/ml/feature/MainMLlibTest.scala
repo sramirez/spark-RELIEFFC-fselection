@@ -111,9 +111,9 @@ object MainMLlibTest {
     continuous = params.getOrElse("continuous", "true").toBoolean
     mrmr = params.getOrElse("mrmr", "false").toBoolean
     lowerFeatThreshold = params.getOrElse("lowerFeatThreshold", "3.0").toFloat
-    numHashTables = params.getOrElse("numHashTables", "25").toInt
+    numHashTables = params.getOrElse("numHashTables", "50").toInt
     bucketWidth = params.getOrElse("bucketWidth", "12").toInt
-    signatureSize = params.getOrElse("signatureSize", "1").toInt
+    signatureSize = params.getOrElse("signatureSize", "5").toInt
     batchSize = params.getOrElse("batchSize", "0.5f").toFloat
     estimationRatio = params.getOrElse("estimationRatio", "1.0f").toFloat
     queryStep = params.getOrElse("queryStep", "2").toInt    

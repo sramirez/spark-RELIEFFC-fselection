@@ -33,6 +33,7 @@ import org.apache.spark.broadcast.Broadcast
 import scala.collection.immutable.Map
 import org.apache.spark.ml.linalg.SparseVector
 import org.apache.spark.util.SizeEstimator
+import org.apache.spark.ml.param.DoubleParam
 
 /**
  * Params for [[LSH]].
@@ -54,7 +55,7 @@ private[ml] trait LSHParams extends HasInputCol with HasOutputCol {
 
   setDefault(numHashTables -> 1)
   
-    /**
+  /**
    * Param for the size of signatures built inside the hash tables.
    *
    * Higher values for this param lead to a reduced false negative rate, 
@@ -69,6 +70,14 @@ private[ml] trait LSHParams extends HasInputCol with HasOutputCol {
   final def getSignatureSize: Int = $(signatureSize)
 
   setDefault(signatureSize -> 16)
+  
+  /* if 0 we use sqrt(originalDim) */
+  final val sparseSpeedup: DoubleParam = new DoubleParam(this, "sparseSpeedup", "", ParamValidators.gtEq(0))
+
+  /** @group getParam */
+  final def getSparseSpeedup: Double = $(sparseSpeedup)
+
+  setDefault(sparseSpeedup -> 0)
   
 
   /**
@@ -381,15 +390,14 @@ private[ml] abstract class LSH[T <: LSHModel[T]]
    * @param inputDim The dimension of the input dataset
    * @return A new LSHModel instance without any params
    */
-  protected[this] def createRawLSHModel(projectedDim: Int, originalDim: Int, isSparse: Boolean, sparseSpeedup: Double): T
+  protected[this] def createRawLSHModel(projectedDim: Int, originalDim: Int, isSparse: Boolean): T
 
   override def fit(dataset: Dataset[_]): T = {
     transformSchema(dataset.schema, logging = true)
     val first = dataset.select(col($(inputCol))).head().get(0).asInstanceOf[Vector]
     val inputDim = first.size
     val isSparse = first.isInstanceOf[SparseVector]
-    
-    val model = createRawLSHModel($(signatureSize), inputDim, isSparse, sparseSpeedup = inputDim).setParent(this)
+    val model = createRawLSHModel($(signatureSize), inputDim, isSparse).setParent(this)
     copyValues(model)
   }
   
@@ -419,6 +427,6 @@ private[ml] trait LSHUtils {
    * The hash function of LSH, mapping an input feature vector to multiple hash vectors.
    * @return The mapping of LSH function.
    */
-  protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Matrix]], Double) => Array[Vector]
+  protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Array[Vector]]], Double) => Array[Vector]
   
 }

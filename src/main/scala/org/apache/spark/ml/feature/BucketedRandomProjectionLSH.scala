@@ -35,6 +35,8 @@ import org.apache.spark.util.SizeEstimator
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
+import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.HashSet
 
 /**
  * :: Experimental ::
@@ -75,14 +77,14 @@ private[ml] trait BucketedRandomProjectionLSHParams extends Params {
 @Since("2.1.0")
 class BucketedRandomProjectionLSHModel private[ml](
     override val uid: String,
-    private[ml] val randUnitVectors: Array[Matrix])
+    private[ml] val randUnitVectors: Array[Array[Vector]])
   extends LSHModel[BucketedRandomProjectionLSHModel] with BucketedRandomProjectionLSHParams {
   
   override protected[ml] val hashFunction: Vector => Array[Vector] = {
     key: Vector => {
       val hashValues = randUnitVectors.map({
         randUnitVector => 
-          randUnitVector.rowIter.map { row => 
+          randUnitVector.map { row => 
             math.floor(key.asBreeze.dot(row.asBreeze) / $(bucketLength))
           }.toArray
       })
@@ -104,7 +106,7 @@ class BucketedRandomProjectionLSHModel private[ml](
   
   override def transform(dataset: Dataset[_]): DataFrame = {
     transformSchema(dataset.schema, logging = true)
-    val bHashFunctions: Broadcast[Array[Matrix]] = dataset.sparkSession.sparkContext.broadcast(randUnitVectors)
+    val bHashFunctions: Broadcast[Array[Array[Vector]]] = dataset.sparkSession.sparkContext.broadcast(randUnitVectors)
     val bl = $(bucketLength)
     val size = SizeEstimator.estimate(randUnitVectors)
     val transformUDF = udf(BucketedRandomProjectionLSH.multipleHashFunction(_: Vector, bHashFunctions, bl), 
@@ -175,17 +177,35 @@ class BucketedRandomProjectionLSH(override val uid: String)
   override protected[this] def createRawLSHModel(
     projectedDim: Int, 
     originalDim: Int, 
-    sparseProjection: Boolean, 
-    sparseSpeedup: Double = 3): BucketedRandomProjectionLSHModel = {
+    sparseProjection: Boolean): BucketedRandomProjectionLSHModel = {
       val rand = new java.util.Random($(seed))
-      val randUnitVectors: Array[Matrix] = {
+      val densityDenom = if($(sparseSpeedup) > 0) $(sparseSpeedup) else math.sqrt(originalDim)
+      val density = 1 / densityDenom
+      val expected = math.ceil(density * originalDim).toInt
+      val randUnitVectors: Array[Array[Vector]] = {
         Array.fill($(numHashTables)) {
-          if(sparseProjection) {
-            val density = 1 / math.sqrt(sparseSpeedup)
-            SparseMatrix.sprandn(projectedDim, originalDim, density, rand)
-          } else {
-            DenseMatrix.randn(projectedDim, originalDim, rand)
-          }        
+          Array.fill(projectedDim) {
+            if(sparseProjection) {
+              if(density < 0.34) {
+                val indices = HashSet[Int]()
+                while (indices.size < expected) { 
+                  indices += rand.nextInt(originalDim)
+                }
+                new SparseVector(originalDim, indices.toArray.sorted, Array.fill(indices.size)(rand.nextGaussian()))
+              } else {
+                val indices = new ArrayBuffer[Int](); val values = new ArrayBuffer[Double]()
+                (0 until originalDim).foreach{ feat =>
+                  if (rand.nextFloat() <= density){
+                    indices += feat
+                    values += rand.nextGaussian()
+                  }
+                }
+                new SparseVector(originalDim, indices.toArray, values.toArray)
+              }              
+            } else {
+              new DenseVector(Array.fill(originalDim)(rand.nextGaussian()))
+            } 
+          }                 
         }
       }
       new BucketedRandomProjectionLSHModel(uid, randUnitVectors)
@@ -219,12 +239,12 @@ object BucketedRandomProjectionLSH extends DefaultParamsReadable[BucketedRandomP
   }
   
   @Since("2.1.0")
-  override protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Matrix]], Double) => Array[Vector] = {
-    (key: Vector, bRandUnitVectors: Broadcast[Array[Matrix]], bucketLength: Double) => {
+  override protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Array[Vector]]], Double) => Array[Vector] = {
+    (key: Vector, bRandUnitVectors: Broadcast[Array[Array[Vector]]], bucketLength: Double) => {
       val sparse = key.asBreeze match { case _: BDV[_] => false; case _: BSV[_] => true}
       val hashValues = bRandUnitVectors.value.map({
         randUnitVector => 
-          randUnitVector.rowIter.map { row => 
+          randUnitVector.map { row => 
             val product = if(sparse){
               key.asBreeze.asInstanceOf[BSV[Double]].dot(row.asBreeze.asInstanceOf[BSV[Double]])
             } else {
@@ -254,7 +274,7 @@ object BucketedRandomProjectionLSHModel extends MLReadable[BucketedRandomProject
     instance: BucketedRandomProjectionLSHModel) extends MLWriter {
 
     // TODO: Save using the existing format of Array[Vector] once SPARK-12878 is resolved.
-    private case class Data(randUnitVectors: Array[Matrix])
+    private case class Data(randUnitVectors: Array[Array[Vector]])
 
     override protected def saveImpl(path: String): Unit = {
       DefaultParamsWriter.saveMetadata(instance, path, sc)
@@ -274,8 +294,8 @@ object BucketedRandomProjectionLSHModel extends MLReadable[BucketedRandomProject
       val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
 
       val dataPath = new Path(path, "data").toString
-      val data = sparkSession.read.parquet(dataPath).select("randUnitVectors").head()
-      val randUnitVectors = data.getAs[Array[Matrix]](0)
+      val data = sparkSession.read.parquet(dataPath).head()
+      val randUnitVectors = data.getAs[Array[Array[Vector]]]("randUnitVectors")
       val model = new BucketedRandomProjectionLSHModel(metadata.uid,
         randUnitVectors)
 
