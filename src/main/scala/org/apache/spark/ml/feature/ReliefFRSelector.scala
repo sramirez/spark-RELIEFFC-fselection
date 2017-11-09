@@ -110,6 +110,14 @@ private[feature] trait ReliefFRSelectorParams extends Params
   final def getBucketLength: Double = $(bucketLength)  
   setDefault(bucketLength -> 4)
 
+  final val sparseSpeedup: DoubleParam = new DoubleParam(this, "sparseSpeedup", "", ParamValidators.gtEq(0))
+
+  /** @group getParam */
+  final def getSparseSpeedup: Double = $(sparseSpeedup)
+
+  setDefault(sparseSpeedup -> 0)
+  
+  
   /**
    * Number of features that selector will select (ordered by statistic value descending). If the
    * number of features is < numTopFeatures, then this will select all features. The default value
@@ -121,7 +129,7 @@ private[feature] trait ReliefFRSelectorParams extends Params
     "Number of features that selector will select, ordered by statistics value descending. If the" +
       " number of features is < numTopFeatures, then this will select all features.",
     ParamValidators.gtEq(1))
-  setDefault(numTopFeatures -> 25)
+  setDefault(numTopFeatures -> 10)
   
   final val numNeighbors = new IntParam(this, "numNeighbors", "",
     ParamValidators.gtEq(1))
@@ -137,7 +145,7 @@ private[feature] trait ReliefFRSelectorParams extends Params
   setDefault(queryStep -> 2)  
   
   final val lowerFeatureThreshold: DoubleParam = new DoubleParam(this, "lowerFeatureThreshold", "", ParamValidators.gtEq(1))
-  setDefault(lowerFeatureThreshold -> 3)
+  setDefault(lowerFeatureThreshold -> 3.0)
   
   final val redundancyRemoval: BooleanParam = new BooleanParam(this, "redundancyRemoval", "")
   setDefault(redundancyRemoval -> true)
@@ -167,6 +175,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   def setQueryStep(value: Int): this.type = set(queryStep, value) 
   def setLowerFeatureThreshold(value: Double): this.type = set(lowerFeatureThreshold, value)
   def setRedundancyRemoval(value: Boolean): this.type = set(redundancyRemoval, value)
+  def setSparseSpeedup(value: Double): this.type = set(sparseSpeedup, value)
   
   // Case class for criteria/feature
   case class F(feat: Int, crit: Double)
@@ -185,9 +194,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     // Get Hash Value of the key 
     val hashOutputCol = "hashRELIEF_" + System.currentTimeMillis()
     val brp = new BucketedRandomProjectionLSH()
-      .setNumHashTables($(numHashTables))
       .setInputCol($(inputCol))
       .setOutputCol(hashOutputCol)
+      .setSparseSpeedup($(sparseSpeedup))
+      .setNumHashTables($(numHashTables))
       .setBucketLength($(bucketLength))
       .setSignatureSize($(signatureSize))
       .setSeed($(seed))
@@ -198,7 +208,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       case Some(l) => l.exists { att => att.isNumeric }
       case None => true
     }
-    dataset.show()
+    logInfo("Applied continuous processing in RELIEF selector: " + continuous)
+    
+    // Generate hash code for the complete dataset
     val modelDataset: DataFrame = if (!dataset.columns.contains(hashOutputCol)) {
         LSHmodel.transform(dataset).cache()
       } else {
@@ -207,9 +219,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     // Get some basic information about the dataset
     val sc = dataset.sparkSession.sparkContext
-    //val bLSHModel = sc.broadcast(LSHmodel)
     val spark = dataset.sparkSession.sqlContext
-    val nElems = modelDataset.count()
+    val nElems = modelDataset.count() // needed to persist the training set
     val first = modelDataset.head().getAs[Vector]($(inputCol))
     val sparse = first.isInstanceOf[SparseVector]
     val nFeat = first.size
@@ -239,7 +250,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       } else {
         query.toDF()
       }  
-      modelQuery.show
       // Index query objects and compute the table that indicates where are located its neighbors
       val idxModelQuery = modelQuery.withColumn("UniqueID", monotonically_increasing_id).cache
       val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(idxModelQuery.select(
@@ -333,12 +343,13 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     case class Localization(part: Short, index: Int)
     val sc = modelDataset.sparkSession.sparkContext
+    val qstep = $(queryStep)
     
     val neighbors = modelDataset.select($(inputCol), hashCol).rdd.mapPartitionsWithIndex { 
         case (pindex, it) => 
           // Initialize the map composed by the priority queue and the central element's ID
           val query = bModelQuery.value // Fields: "UniqueID", $(inputCol), $(labelCol), "hashOutputCol"
-          val ordering = Ordering[Float].on[(Float, Localization)](-_._1)   
+          val ordering = Ordering[Float].on[(Float, Localization)](_._1).reverse// BPQ needs reverse ordering   
           val neighbors = query.map { case Row(id: Long, _, _, _) => 
             id -> new BoundedPriorityQueue[(Float, Localization)](k)(ordering)
           }   
@@ -349,12 +360,11 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             val Row(inputNeig: Vector, hashNeig: WrappedArray[Vector]) = it.next
             (0 until query.size).foreach { j => 
                val Row(_, inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
-               val hdist = BucketedRandomProjectionLSH.hashDistance(hashQuery.array, hashNeig.array)
+               val hdist = BucketedRandomProjectionLSH.hashThresholdedDistance(hashQuery.array, hashNeig.array, qstep)
                if(hdist < Double.PositiveInfinity) {
                  val distance = BucketedRandomProjectionLSH.keyDistance(inputQuery, inputNeig)
                  neighbors(j)._2 += distance.toFloat -> Localization(pindex.toShort, i)
-               }
-                 
+               }  
             }
             i += 1              
           }            

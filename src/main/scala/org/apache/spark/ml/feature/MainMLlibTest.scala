@@ -36,6 +36,8 @@ import org.apache.spark.ml.attribute.Attribute
 import org.apache.spark.ml.util.MetadataUtils
 import org.apache.spark.sql.Dataset
 import org.apache.spark.ml.linalg.DenseMatrix
+import org.apache.spark.ml.linalg.SparseVector
+import org.apache.spark.sql.functions._
 
 
 /**
@@ -487,7 +489,7 @@ object MainMLlibTest {
 
     val pipeline = new Pipeline().setStages(indexers)
     val typedDF = pipeline.fit(df).transform(df).drop(stringTypes: _*)
-
+    
     println("Indexed Schema: " + typedDF.schema)
     
     // Clean Label Column
@@ -504,11 +506,15 @@ object MainMLlibTest {
     } else {
       cleanedDF.select(clsLabel, inputLabel)
     }
+    val majoritySparse = processedDF.rdd.map{case Row(cls: Double, features: Vector) => 
+      features.isInstanceOf[SparseVector]}.countByValue().max._1
+    val standarizeTypeUDF = udf((feat: Vector) => if(majoritySparse) feat.toSparse else feat.toDense)
+    processedDF = processedDF.withColumn(inputLabel, standarizeTypeUDF(col(inputLabel)))
     
     println("clsLabel: " + clsLabel)
     println("Columns: " + processedDF.columns.mkString(","))
     println("Schema: " + processedDF.schema.toString)
-    println(processedDF.first.get(1))
+    processedDF.show()
       
     //if(discretize || (continuous && format == "libsvm")){ 
     if(discretize) {

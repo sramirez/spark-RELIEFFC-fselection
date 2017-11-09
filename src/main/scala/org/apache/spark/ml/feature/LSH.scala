@@ -120,8 +120,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
    */
   protected[ml] def hashDistance(x: Seq[Vector], y: Seq[Vector]): Double
   
-  def transform(dataset: Dataset[_]): DataFrame
-  
+    
   /**
    * Calculate the distance between two different hash Vectors, imposing a 
    * lower limit (+/- 1) to the distance, and a upper one to the number of projections 
@@ -150,6 +149,8 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
     }.min
   }
 
+  
+  def transform(dataset: Dataset[_]): DataFrame
 
   override def transformSchema(schema: StructType): StructType = {
     validateAndTransformSchema(schema)
@@ -382,7 +383,8 @@ private[ml] abstract class LSH[T <: LSHModel[T]]
   /** @group setParam */
   def setSignatureSize(value: Int): this.type = set(signatureSize, value)
   
-
+  /** @group setParam */
+  def setSparseSpeedup(value: Double): this.type = set(sparseSpeedup, value)
   /**
    * Validate and create a new instance of concrete LSHModel. Because different LSHModel may have
    * different initial setting, developer needs to define how their LSHModel is created instead of
