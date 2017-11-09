@@ -32,6 +32,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.broadcast.Broadcast
 import scala.collection.immutable.Map
 import org.apache.spark.ml.linalg.SparseVector
+import org.apache.spark.util.SizeEstimator
 
 /**
  * Params for [[LSH]].
@@ -86,14 +87,6 @@ private[ml] trait LSHParams extends HasInputCol with HasOutputCol {
 private[ml] abstract class LSHModel[T <: LSHModel[T]]
   extends Model[T] with LSHParams with MLWritable {
   self: T =>
-
-  /**
-   * The hash function of LSH, mapping an input feature vector to multiple hash vectors.
-   * @return The mapping of LSH function.
-   */
-  protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Matrix]], Double) => Array[Vector]
-  
-  
   /**
    * The hash function of LSH, mapping an input feature vector to multiple hash vectors.
    * @return The mapping of LSH function.
@@ -118,11 +111,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
    */
   protected[ml] def hashDistance(x: Seq[Vector], y: Seq[Vector]): Double
   
-  protected[ml] def getHashFunctions(): Array[Matrix]
-  
-  protected[ml] def getBL(): Double
-  
-  
+  def transform(dataset: Dataset[_]): DataFrame
   
   /**
    * Calculate the distance between two different hash Vectors, imposing a 
@@ -152,16 +141,6 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
     }.min
   }
 
-  override def transform(dataset: Dataset[_]): DataFrame = {
-    transformSchema(dataset.schema, logging = true)
-    val bHashFunctions: Broadcast[Array[Matrix]] = dataset.sparkSession.sparkContext.broadcast(getHashFunctions())
-    val bucketLength = this.getBL()
-    val bMultipleHF = dataset.sparkSession.sparkContext.broadcast(multipleHashFunction)
-    val transformUDF = udf(bMultipleHF.value(_: Vector, bHashFunctions, bucketLength), DataTypes.createArrayType(new VectorUDT))
-    val transformed = dataset.withColumn($(outputCol), transformUDF(dataset($(inputCol))))
-    bMultipleHF.destroy()
-    transformed
-  }
 
   override def transformSchema(schema: StructType): StructType = {
     validateAndTransformSchema(schema)
@@ -413,5 +392,33 @@ private[ml] abstract class LSH[T <: LSHModel[T]]
     val model = createRawLSHModel($(signatureSize), inputDim, isSparse, sparseSpeedup = inputDim).setParent(this)
     copyValues(model)
   }
+  
+}
+
+private[ml] trait LSHUtils {
+  
+  /**
+   * Calculate the distance between two different keys using the distance metric corresponding
+   * to the hashFunction.
+   * @param x One input vector in the metric space.
+   * @param y One input vector in the metric space.
+   * @return The distance between x and y.
+   */
+  protected[ml] def keyDistance(x: Vector, y: Vector): Double
+
+  /**
+   * Calculate the distance between two different hash Vectors.
+   *
+   * @param x One of the hash vector.
+   * @param y Another hash vector.
+   * @return The distance between hash vectors x and y.
+   */
+  protected[ml] def hashDistance(x: Seq[Vector], y: Seq[Vector]): Double
+  
+  /**
+   * The hash function of LSH, mapping an input feature vector to multiple hash vectors.
+   * @return The mapping of LSH function.
+   */
+  protected[ml] val multipleHashFunction: (Vector, Broadcast[Array[Matrix]], Double) => Array[Vector]
   
 }

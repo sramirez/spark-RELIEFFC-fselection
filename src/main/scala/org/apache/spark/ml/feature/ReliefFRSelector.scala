@@ -200,18 +200,15 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     }
     dataset.show()
     val modelDataset: DataFrame = if (!dataset.columns.contains(hashOutputCol)) {
-        LSHmodel.transform(dataset)
+        LSHmodel.transform(dataset).cache()
       } else {
         dataset.toDF()
       }
-    modelDataset.cache()
-    val weights = Array.fill((1 / $(batchSize)).toInt)($(estimationRatio) * $(batchSize))
-    val batches = modelDataset.randomSplit(weights, $(seed))
     
     // Get some basic information about the dataset
-    val sc = modelDataset.sparkSession.sparkContext
-    val bLSHModel = sc.broadcast(LSHmodel)
-    val spark = modelDataset.sparkSession.sqlContext
+    val sc = dataset.sparkSession.sparkContext
+    //val bLSHModel = sc.broadcast(LSHmodel)
+    val spark = dataset.sparkSession.sqlContext
     val nElems = modelDataset.count()
     val first = modelDataset.head().getAs[Vector]($(inputCol))
     val sparse = first.isInstanceOf[SparseVector]
@@ -225,6 +222,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val schema = new StructType()
             .add(StructField("id2", IntegerType, true))
             .add(StructField("score2", FloatType, true))
+    val weights = Array.fill((1 / $(batchSize)).toInt)($(estimationRatio) * $(batchSize))
+    val batches = modelDataset.randomSplit(weights, $(seed))
     var featureWeights: BV[Float] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
     var jointMatrix: BM[Double] = if (sparse) CSCMatrix.zeros(nFeat, nFeat) else BM.zeros(nFeat, nFeat) 
     var marginalVector: BV[Double] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
@@ -247,7 +246,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           col("UniqueID"), col($(inputCol)), col($(labelCol)), col(hashOutputCol)).collect())
           
       val neighbors: RDD[(Long, Map[Short, Iterable[Int]])] = approxNNByPartition(idxModelQuery, 
-          bFullQuery, bLSHModel, $(numNeighbors) * priorClass.size, hashOutputCol)
+          bFullQuery, $(numNeighbors) * priorClass.size, hashOutputCol)
       
       val bNeighborsTable: Broadcast[Map[Long, Map[Short, Iterable[Int]]]] = 
           sc.broadcast(neighbors.collectAsMap().toMap)
@@ -304,7 +303,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     // Unpersist partial results
     (0 until batches.size).foreach(i => results(i).unpersist())
-    bLSHModel.destroy()
+    //bLSHModel.destroy()
 
     // normalized redundancy
     val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat, continuous, sparse)
@@ -329,7 +328,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   private def approxNNByPartition(
       modelDataset: Dataset[_],
       bModelQuery: Broadcast[Array[Row]],
-      model: Broadcast[BucketedRandomProjectionLSHModel],
       k: Int,
       hashCol: String): RDD[(Long, Map[Short, Iterable[Int]])] = {
     
@@ -351,9 +349,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             val Row(inputNeig: Vector, hashNeig: WrappedArray[Vector]) = it.next
             (0 until query.size).foreach { j => 
                val Row(_, inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
-               val hdist = model.value.hashDistance(hashQuery.array, hashNeig.array)
+               val hdist = BucketedRandomProjectionLSH.hashDistance(hashQuery.array, hashNeig.array)
                if(hdist < Double.PositiveInfinity) {
-                 val distance = model.value.keyDistance(inputQuery, inputNeig)
+                 val distance = BucketedRandomProjectionLSH.keyDistance(inputQuery, inputNeig)
                  neighbors(j)._2 += distance.toFloat -> Localization(pindex.toShort, i)
                }
                  
@@ -649,18 +647,19 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   }
 
   
-   def selectFeatures(reliefRanking: RDD[(Int, Float)],
+  def selectFeatures(reliefRanking: RDD[(Int, Float)],
       redundancyMatrix: BM[Double], nFeat: Int): (Seq[F], Seq[F]) = {
     
     // Initialize all (except the class) criteria with the relevance values
     val reliefNoColl = reliefRanking.takeOrdered($(numTopFeatures))(Ordering[(Double, Int)].on(f => (-f._2, f._1)))
       .map{case (feat, crit) => F(feat, crit)}.toSeq
     val actualWeights = reliefRanking.mapValues{ score => new FeatureScore().init(score.toFloat)}.sortBy(_._1).collect()
-    val pool = Array.fill(nFeat)(new FeatureScore().init(Float.NegativeInfinity))
-    actualWeights.foreach{case (id, score) => pool(id) = score}
+    println("actualWeights size: " + actualWeights.size)
+    val pool: Array[Option[FeatureScore]] = Array.fill(nFeat)(None)
+    actualWeights.foreach{case (id, score) => pool(id) = Some(score)}
     // Get the maximum and initialize the set of selected features with it
     var selected = Seq(reliefNoColl.head)
-    pool(reliefNoColl.head.feat).valid = false
+    pool(reliefNoColl.head.feat).get.valid = false
     var moreFeat = true
     
     // Iterative process for redundancy and conditional redundancy
@@ -672,13 +671,13 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           val begin = bsm.colPtrs(selected.head.feat)
           val end = bsm.colPtrs(selected.head.feat + 1)
           bsm.rowIndices.slice(begin, end).foreach{ k =>
-            if(pool(k).valid)
-              pool(k).update(bsm.data(k).toFloat)
+            if(pool(k).get.valid)
+              pool(k).get.update(bsm.data(k).toFloat)
           }
         case bdm: BDM[Double] =>
           (0 until pool.size).foreach{ k =>            
-            if(pool(k).valid)
-              pool(k).update(bdm(k, selected.head.feat).toFloat)
+            if(pool(k).get.valid)
+              pool(k).get.update(bdm(k, selected.head.feat).toFloat)
           }
       }
       
@@ -686,9 +685,12 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       var max = new FeatureScore().init(Float.NegativeInfinity); var maxi = -1
       val maxscore = max.score
       (0 until pool.size).foreach{ i => 
-        val crit = pool(i)
-        if(crit.valid && crit.score > max.score){
-          maxi = i; max = crit
+        pool(i) match {
+          case Some(crit) => 
+            if(crit.valid && crit.score > max.score){
+              maxi = i; max = crit
+            } 
+          case None => /* Do nothing */
         }
       }
       
