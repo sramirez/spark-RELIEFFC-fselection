@@ -71,6 +71,8 @@ object MainMLlibTest {
   var estimationRatio = 1.0f
   var queryStep = 2
   var format = "csv"
+  var sparseSpeedup = 0
+  var predict: Boolean = false
   
   
   var mrmr: Boolean = false
@@ -111,6 +113,7 @@ object MainMLlibTest {
     k = params.getOrElse("k", "5").toInt
     nselect = params.getOrElse("nselect", "10").toInt
     continuous = params.getOrElse("continuous", "true").toBoolean
+    predict = params.getOrElse("predict", "false").toBoolean
     mrmr = params.getOrElse("mrmr", "false").toBoolean
     lowerFeatThreshold = params.getOrElse("lowerFeatThreshold", "3.0").toFloat
     numHashTables = params.getOrElse("numHashTables", "50").toInt
@@ -121,15 +124,15 @@ object MainMLlibTest {
     queryStep = params.getOrElse("queryStep", "2").toInt    
     mode = params.getOrElse("mode", "final")
     format = params.getOrElse("format", "csv")
+    sparseSpeedup = params.getOrElse("sparseSpeedup", "0").toInt
     
     println("Params used: " +  params.mkString("\n"))
     
     val rawDF = TestHelper.readData(sqlContext, pathFile, firstHeader, format).repartition(nPartitions).cache
-    rawDF.show
+    rawDF.count()
     val df = preProcess(rawDF).select(clsLabel, inputLabel).cache
-    df.show
+    df.count()
     rawDF.unpersist()
-
     
     if(mode == "test-lsh"){
       this.testLSHPerformance(df)
@@ -304,30 +307,22 @@ object MainMLlibTest {
     if(mrmr){      
       val mRMRmodel = fitMRMR(inputData)
       println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
-      mrmrAcc = kCVPerformance(inputData, mRMRmodel, "nb")
-      mrmrAccDT = kCVPerformance(inputData, mRMRmodel, "dt")
-      mrmrAccLR = kCVPerformance(inputData, mRMRmodel, "lr")
+      mrmrAccDT = kCVPerformance(mRMRmodel.transform(inputData), "dt")
+      mrmrAccLR = kCVPerformance(mRMRmodel.transform(inputData), "lr")
       selectedMRMR = mRMRmodel.selectedFeatures.map(_ + 1).mkString(",")
     }
       
     var relCAcc = 0.0f; var relAcc = 0.0f; var acc = 0.0f;
-    if(!cont){
-      // NB does not accept negative values.
-      relCAcc = kCVPerformance(inputData, reliefCollModel, "nb")   
-      relAcc = kCVPerformance(inputData, reliefModel, "nb")   
-      acc = kCVPerformance(inputData, null, "nb")   
-    }
-    val relCAccDT = kCVPerformance(inputData, reliefCollModel, "dt")   
-    val relAccDT = kCVPerformance(inputData, reliefModel, "dt")   
-    val accDT = kCVPerformance(inputData, null, "dt")   
-    val relCAccLR = kCVPerformance(inputData, reliefCollModel, "lr") 
-    val relAccLR = kCVPerformance(inputData, reliefModel, "lr") 
-    val accLR = kCVPerformance(inputData, null, "lr")
+    val reducedRC = reliefCollModel.transform(inputData).cache()
+    val reducedR = reliefModel.transform(inputData).cache()
+    
+    val relCAccDT = kCVPerformance(reducedRC, "dt")   
+    val relAccDT = kCVPerformance(reducedR, "dt")   
+    val accDT = kCVPerformance(inputData, "dt")   
+    val relCAccLR = kCVPerformance(reducedRC, "lr") 
+    val relAccLR = kCVPerformance(reducedR, "lr") 
+    val accLR = kCVPerformance(inputData, "lr")
 
-    println("Train accuracy for mRMR (Naive Bayes) = " + mrmrAcc)
-    println("Train accuracy for Relief (Naive Bayes) = " + relAcc)
-    println("Train accuracy for ReliefColl (Naive Bayes) = " + relCAcc)
-    println("Baseline train accuracy (Naive Bayes) = " + acc)
     println("Train accuracy for mRMR (Decision Tree) = " + mrmrAccDT)
     println("Train accuracy for ReliefColl (Decision Tree) = " + relCAccDT)
     println("Train accuracy for Relief (Decision Tree) = " + relAccDT)
@@ -342,18 +337,11 @@ object MainMLlibTest {
     println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
   }
   
-  def kCVPerformance(df: DataFrame, fsmodel: InfoThSelectorModel, classifier: String) = {
+  def kCVPerformance(df: Dataset[Row], classifier: String) = {
     
-    var inputCol = "selectedFeatures"
     var labelCol = clsLabel
-    val reducedData = if(fsmodel != null) {
-      fsmodel.transform(df)
-    } else {
-      inputCol = inputLabel
-      df
-    }
-    println("Reduced schema: " + reducedData.schema)
-    val splits = MLUtils.kFold(reducedData.rdd, 10, seed)
+    var inputCol = if(df.schema.fieldNames.exists { _ == "selectedFeatures" }) "selectedFeatures" else inputLabel
+    val splits = MLUtils.kFold(df.rdd, 10, seed)
     val sql = df.sqlContext
     
     val estimator = if(classifier == "nb") {
@@ -365,14 +353,14 @@ object MainMLlibTest {
       val labelIndexer = new StringIndexer()
           .setInputCol(labelCol)
           .setOutputCol("indexedLabel")
-          .fit(reducedData)
+          .fit(df)
       labelCol = "indexedLabel"    
       // Automatically identify categorical features, and index them.
       val featureIndexer = new VectorIndexer()
         .setInputCol(inputCol)
         .setOutputCol("indexedFeatures")
         .setMaxCategories(15) // features with > 4 distinct values are treated as continuous.
-        .fit(reducedData)
+        .fit(df)
         
       inputCol = "indexedFeatures"
       
@@ -400,13 +388,11 @@ object MainMLlibTest {
         .setMetricName("accuracy")
         
         
-    reducedData.col(reducedData.columns.head)
-        
     //K-folding operation starting
     //for each fold you have multiple models created cfm. the paramgrid
     val sum = splits.zipWithIndex.map { case ((training, validation), _) =>
-      val trainingDataset = sql.createDataFrame(training, reducedData.schema).cache()
-      val validationDataset = sql.createDataFrame(validation, reducedData.schema).cache()
+      val trainingDataset = sql.createDataFrame(training, df.schema).cache()
+      val validationDataset = sql.createDataFrame(validation, df.schema).cache()
 
       val model = estimator.fit(trainingDataset)
       trainingDataset.unpersist()
@@ -562,7 +548,7 @@ object MainMLlibTest {
     }
   }
   
-  def fitMRMR(df: DataFrame) = {
+  def fitMRMR(df: Dataset[_]) = {
     val selector = new InfoThSelector()
         .setSelectCriterion("mrmr")
         .setNPartitions(nPartitions)
@@ -613,9 +599,10 @@ object MainMLlibTest {
     
   }
   
-  def testFinalSelector(df: Dataset[_]) {
+  def testFinalSelector(df: Dataset[Row]) {
     
-    val nFeat = df.select(inputLabel).head().getAs[Vector](0).size
+    val nFeat = df.head().getAs[Vector](inputLabel).size
+    println("Total features: " + nFeat)
     val nelems = df.count()
     
     val selector = new ReliefFRSelector()
@@ -625,6 +612,7 @@ object MainMLlibTest {
       .setNumHashTables(numHashTables)
       .setBucketLength(bucketWidth)
       .setSignatureSize(signatureSize)
+      .setSparseSpeedup(sparseSpeedup)
       .setSeed(seed)
       .setNumNeighbors(k)
       .setNumTopFeatures(nselect)
@@ -634,9 +622,53 @@ object MainMLlibTest {
       .setQueryStep(queryStep)
       .setDiscreteData(discretize || !continuous)
     
-    val model = selector.fit(df)  
-    val reduced = model.transform(df)
-    reduced.count()
+    val now = System.currentTimeMillis
+    val model = selector.fit(df)
+    val runtime = (System.currentTimeMillis - now) / 1000
+    println("Feature selection model trained in " + runtime + "s")
+    
+    if(predict) {
+      // Print best features according to the RELIEF-F measure
+      val reliefCollModel = model.setRedundancyRemoval(true)
+      val reliefModel = model.setRedundancyRemoval(false)
+      val outRC = reliefCollModel.getSelectedFeatures().mkString("\n")
+      val outR = reliefModel.getSelectedFeatures().mkString("\n")
+      println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
+      println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
+      
+      var mrmrAcc = 0.0f; var mrmrAccDT = 0.0f; var mrmrAccLR = 0.0f; var selectedMRMR = new String();
+      if(mrmr){      
+        val mRMRmodel = fitMRMR(df)
+        println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
+        mrmrAccDT = kCVPerformance(mRMRmodel.transform(df), "dt")
+        mrmrAccLR = kCVPerformance(mRMRmodel.transform(df), "lr")
+        selectedMRMR = mRMRmodel.selectedFeatures.map(_ + 1).mkString(",")
+      }
+        
+      var relCAcc = 0.0f; var relAcc = 0.0f; var acc = 0.0f;
+      val reducedRC = reliefCollModel.transform(df).cache()
+      val reducedR = reliefModel.transform(df).cache()
+      
+      val relCAccDT = kCVPerformance(reducedRC, "dt")   
+      val relAccDT = kCVPerformance(reducedR, "dt")   
+      val accDT = kCVPerformance(df, "dt")   
+      val relCAccLR = kCVPerformance(reducedRC, "lr") 
+      val relAccLR = kCVPerformance(reducedR, "lr") 
+      val accLR = kCVPerformance(df, "lr")
+  
+      println("Train accuracy for mRMR (Decision Tree) = " + mrmrAccDT)
+      println("Train accuracy for ReliefColl (Decision Tree) = " + relCAccDT)
+      println("Train accuracy for Relief (Decision Tree) = " + relAccDT)
+      println("Baseline train accuracy (Decision Tree) = " + accDT)
+      println("Train accuracy for mRMR (LR) = " + mrmrAccLR)
+      println("Train accuracy for ReliefColl (LR) = " + relCAccLR)
+      println("Train accuracy for Relief (LR) = " + relAccLR)
+      println("Baseline train accuracy (LR) = " + accLR)
+      
+    
+    }
+    println("\n*** Modeling runtime for FS: " + runtime + "s")    
+
   }
   
   
