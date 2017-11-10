@@ -108,7 +108,7 @@ object MainMLlibTest {
     padded = params.getOrElse("padded", "0").toInt
     classLastIndex = params.getOrElse("class-last", "false").toBoolean
     firstHeader = params.getOrElse("header", "false").toBoolean
-    k = params.getOrElse("k", "10").toInt
+    k = params.getOrElse("k", "5").toInt
     nselect = params.getOrElse("nselect", "10").toInt
     continuous = params.getOrElse("continuous", "true").toBoolean
     mrmr = params.getOrElse("mrmr", "false").toBoolean
@@ -506,8 +506,9 @@ object MainMLlibTest {
     } else {
       cleanedDF.select(clsLabel, inputLabel)
     }
+    // If format is not csv and most of instances are sparse, then all are transformed to sparse
     val majoritySparse = processedDF.rdd.map{case Row(cls: Double, features: Vector) => 
-      features.isInstanceOf[SparseVector]}.countByValue().max._1
+      features.isInstanceOf[SparseVector]}.countByValue().max._1 && format != "csv"
     val standarizeTypeUDF = udf((feat: Vector) => if(majoritySparse) feat.toSparse else feat.toDense)
     processedDF = processedDF.withColumn(inputLabel, standarizeTypeUDF(col(inputLabel)))
     
@@ -537,10 +538,9 @@ object MainMLlibTest {
         .setInputCol(inputLabel)
         .setOutputCol("norm-" + inputLabel)
         .setWithStd(true)
-        .setWithMean(true)
+        .setWithMean(false) // avoids problems with sparse data
       
       val smodel = scaler.fit(processedDF)
-      println(smodel.mean)
       processedDF = smodel.transform(processedDF)
       inputLabel = "norm-" + inputLabel
     }
@@ -632,6 +632,7 @@ object MainMLlibTest {
       .setBatchSize(batchSize)
       .setLowerFeatureThreshold(lowerFeatThreshold)
       .setQueryStep(queryStep)
+      .setDiscreteData(discretize || !continuous)
     
     val model = selector.fit(df)  
     val reduced = model.transform(df)
