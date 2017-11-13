@@ -66,13 +66,13 @@ object MainMLlibTest {
   var bucketWidth = 4
   var signatureSize = 5
   var mode = "test-lsh"
-  var percTest = 0.2f
   var batchSize = 0.25f
   var estimationRatio = 1.0f
   var queryStep = 2
   var format = "csv"
   var sparseSpeedup = 0
   var predict: Boolean = false
+  var sampling = 1.0f
   
   
   var mrmr: Boolean = false
@@ -125,10 +125,14 @@ object MainMLlibTest {
     mode = params.getOrElse("mode", "final")
     format = params.getOrElse("format", "csv")
     sparseSpeedup = params.getOrElse("sparseSpeedup", "0").toInt
+    sampling = params.getOrElse("sampling", "0.05f").toFloat
     
     println("Params used: " +  params.mkString("\n"))
     
-    val rawDF = TestHelper.readData(sqlContext, pathFile, firstHeader, format).repartition(nPartitions).cache
+    val rawDF = TestHelper.readData(sqlContext, pathFile, firstHeader, format)
+        //.sample(false, sampling, seed)
+        .repartition(nPartitions)
+        .cache
     rawDF.count()
     val df = preProcess(rawDF).select(clsLabel, inputLabel).cache
     df.count()
@@ -152,7 +156,7 @@ object MainMLlibTest {
         LabeledPoint(label, features)
     }.cache //zipwithUniqueIndexs
     
-    //Dataframe version
+    // Dataframe version
     val inputData = sqlContext.createDataFrame(origRDD, df.schema).cache()
     println("Schema: " + inputData.schema)
     
@@ -475,7 +479,6 @@ object MainMLlibTest {
 
     val pipeline = new Pipeline().setStages(indexers)
     val typedDF = pipeline.fit(df).transform(df).drop(stringTypes: _*)
-    
     println("Indexed Schema: " + typedDF.schema)
     
     // Clean Label Column
@@ -492,20 +495,19 @@ object MainMLlibTest {
     } else {
       cleanedDF.select(clsLabel, inputLabel)
     }
+    
     // If format is not csv and most of instances are sparse, then all are transformed to sparse
     val majoritySparse = processedDF.rdd.map{case Row(cls: Double, features: Vector) => 
       features.isInstanceOf[SparseVector]}.countByValue().max._1 && format != "csv"
     val standarizeTypeUDF = udf((feat: Vector) => if(majoritySparse) feat.toSparse else feat.toDense)
     processedDF = processedDF.withColumn(inputLabel, standarizeTypeUDF(col(inputLabel)))
-    
     println("clsLabel: " + clsLabel)
     println("Columns: " + processedDF.columns.mkString(","))
     println("Schema: " + processedDF.schema.toString)
     processedDF.show()
       
-    //if(discretize || (continuous && format == "libsvm")){ 
     if(discretize) {
-      // Continuous data from LIBSVM has to discretized since
+      // Continuous data from LIBSVM has to be discretized since
       // ML does not allow fair normalization of sparse vectors
       val discretizer = new MDLPDiscretizer()
         .setMaxBins(15)
@@ -569,21 +571,21 @@ object MainMLlibTest {
       .setNumHashTables(numHashTables)
       .setInputCol(inputLabel)
       .setOutputCol("hashCol")
+      .setNumHashTables(numHashTables)
       .setBucketLength(bucketWidth)
       .setSignatureSize(signatureSize)
+      .setSparseSpeedup(sparseSpeedup)
       .setSeed(seed)
-    val keys = df.select(inputLabel).sample(false, percTest, seed).collect()
+   val model = brp.fit(df)
+      
+      // Sample only some elements to test
+    val keys = df.select(inputLabel).sample(false, sampling, seed).collect()
     
-    var sumer = 0.0
-    var sump = 0.0
-    var sumr = 0.0
-    var red = 0L
-    var sumtime = 0.0
-    var sumMax = 0.0
-    var maxd = 0.0
+    var sumer = 0.0; var sump = 0.0; var sumr = 0.0; var red = 0L; var sumtime = 0.0; 
+    var sumMax = 0.0; var maxd = 0.0
     keys.foreach { case Row(key: Vector) =>  
       val (errorRatio, precision, recall, redundancy, time, maxdist) = LSHTest.calculateApproxNearestNeighbors(
-          brp, df, key, k, "multi", "distCol") 
+          model, df, key, k, "multi", "distCol", nelems) 
       sump += precision; sumr += recall; red += redundancy; sumtime += time; sumMax += maxdist; sumer += errorRatio
       if(maxdist > maxd) 
         maxd = maxdist

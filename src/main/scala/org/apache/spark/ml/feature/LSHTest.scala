@@ -102,31 +102,30 @@ private[ml] object LSHTest {
    * @return A tuple of two doubles, representing precision and recall rate
    */
   def calculateApproxNearestNeighbors[T <: LSHModel[T]](
-      lsh: LSH[T],
+      model: LSHModel[T],
       dataset: Dataset[_],
       key: Vector,
       k: Int,
       probeMode: String,
-      distCol: String) = {
-    val model = lsh.fit(dataset)
+      distCol: String,
+      nelems: Long) = {
 
-    // Compute expected
+    // Compute real neighbors
     val distUDF = udf((x: Vector) => model.keyDistance(x, key), DataTypes.DoubleType)
     val distColumn = distUDF(col(model.getInputCol))
-    val hashDistUDF = udf((x: Vector) => model.hashDistance(model.hashFunction(x), model.hashFunction(key)), DataTypes.DoubleType)
-    val hdistColumn = hashDistUDF(col(model.getInputCol))
-    
-    val modelDatasetWithDist = dataset.withColumn("realDist", distColumn)//.withColumn("hashDist", hdistColumn)
-    val expected = modelDatasetWithDist.sort("realDist").limit(k).cache
+    val modelDatasetWithDist = dataset.withColumn("realDist", distColumn)
+    val quantile = modelDatasetWithDist.stat.approxQuantile("realDist", Array(k / nelems.toDouble), 0.05)(0)
+    val expected = modelDatasetWithDist.filter(col("realDist").leq(quantile)).sort("realDist").limit(k).cache
+    //val expected2 = modelDatasetWithDist.sort("realDist").limit(k).cache
     val nexpected = expected.count()
     val farthestNeighbor = expected.sort(desc("realDist")).select(model.getInputCol).head().getAs[Vector](0)
     val maxHashDist = math.sqrt(model.hashDistance(model.hashFunction(farthestNeighbor), model.hashFunction(key)))
     
     // Compute query time
-    val s = System.nanoTime
-    val (redundancy, actual) = model.approxNearestNeighbors(dataset, key, k, probeMode = probeMode, distCol)
+    val s = System.currentTimeMillis()
+    val (redundancy, actual) = model.approxNearestNeighbors(dataset, key, k, probeMode = probeMode, distCol, nelems)
     val nactual = actual.cache.count()
-    val queryTime = (System.nanoTime - s) / 1e9d // in s
+    val queryTime = (System.currentTimeMillis() - s) / 1000 // in s
     
     // Compute precision and recall
     val error = actual.select(distCol).collect().zip(expected.select("realDist")collect()).map{ 
