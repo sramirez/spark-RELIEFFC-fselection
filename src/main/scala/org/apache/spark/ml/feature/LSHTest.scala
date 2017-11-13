@@ -113,7 +113,7 @@ private[ml] object LSHTest {
     // Compute real neighbors
     val distUDF = udf((x: Vector) => model.keyDistance(x, key), DataTypes.DoubleType)
     val distColumn = distUDF(col(model.getInputCol))
-    val modelDatasetWithDist = dataset.withColumn("realDist", distColumn)
+    val modelDatasetWithDist = dataset.withColumn("realDist", distColumn).cache()
     val quantile = modelDatasetWithDist.stat.approxQuantile("realDist", Array(k / nelems.toDouble), 0.05)(0)
     val expected = modelDatasetWithDist.filter(col("realDist").leq(quantile)).sort("realDist").limit(k).cache
     //val expected2 = modelDatasetWithDist.sort("realDist").limit(k).cache
@@ -123,8 +123,10 @@ private[ml] object LSHTest {
     
     // Compute query time
     val s = System.currentTimeMillis()
-    val (redundancy, actual) = model.approxNearestNeighbors(dataset, key, k, probeMode = probeMode, distCol, nelems)
-    val nactual = actual.cache.count()
+    val (redundancy, ractual) = model.approxNearestNeighbors(dataset, key, k, 
+        probeMode = probeMode, distCol, nelems)
+    val actual = ractual.cache()
+    val nactual = actual.count()
     val queryTime = (System.currentTimeMillis() - s) / 1000 // in s
     
     // Compute precision and recall
@@ -134,6 +136,7 @@ private[ml] object LSHTest {
     }.sum
     
     val correctCount = expected.join(actual, model.getInputCol).count().toDouble
+    modelDatasetWithDist.unpersist(); actual.unpersist()
     (error / (nactual * nexpected), correctCount / nactual, correctCount / nexpected, redundancy, queryTime, maxHashDist)
   }
 

@@ -125,7 +125,7 @@ object MainMLlibTest {
     mode = params.getOrElse("mode", "final")
     format = params.getOrElse("format", "csv")
     sparseSpeedup = params.getOrElse("sparseSpeedup", "0").toInt
-    sampling = params.getOrElse("sampling", "0.05f").toFloat
+    sampling = params.getOrElse("sampling", "0.001f").toFloat
     
     println("Params used: " +  params.mkString("\n"))
     
@@ -580,22 +580,27 @@ object MainMLlibTest {
       
       // Sample only some elements to test
     val keys = df.select(inputLabel).sample(false, sampling, seed).collect()
+    println("Number of examples used in estimation: " + keys.length)
     
     var sumer = 0.0; var sump = 0.0; var sumr = 0.0; var red = 0L; var sumtime = 0.0; 
-    var sumMax = 0.0; var maxd = 0.0
+    var sumMax = 0.0; var maxd = 0.0; var cont = 0
     keys.foreach { case Row(key: Vector) =>  
       val (errorRatio, precision, recall, redundancy, time, maxdist) = LSHTest.calculateApproxNearestNeighbors(
           model, df, key, k, "multi", "distCol", nelems) 
       sump += precision; sumr += recall; red += redundancy; sumtime += time; sumMax += maxdist; sumer += errorRatio
       if(maxdist > maxd) 
         maxd = maxdist
+      cont += 1
+      println("# instances completed: " + cont)
     }
-    println("Average error Ratio: " + sumer / keys.size)
     println("Average precision: " + sump / keys.size)
     println("Average recall: " + sumr / keys.size)
     println("Average selectivity: " + red / keys.size)
     println("Average runtime (in s): " + sumtime / keys.size)
     println("Number of hash tables: " + numHashTables)
+    println("Signature size: " + signatureSize)
+    println("Bucket width: " + bucketWidth)
+    println("Average error ratio (distance): " + sumer / keys.size)
     println("Average maximum distance: " + sumMax / keys.size)
     println("Total Maximum distance: " + maxd)
     
