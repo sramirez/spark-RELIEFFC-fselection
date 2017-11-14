@@ -327,7 +327,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     //bLSHModel.destroy()
 
     // normalized redundancy
-    val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat, sparse)
+    val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat)
     val rddFinalWeights = finalWeights.rdd.map{ case Row(k: Int, _, normScore: Float) => (k, normScore)}
     val (reliefCol, relief) = selectFeatures(rddFinalWeights, redundancyMatrix, nFeat)
     val outRC = reliefCol.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
@@ -642,7 +642,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   }
   
   private def computeRedudancy(rawJoint: BM[Double], rawMarginal: BV[Double], 
-      total: Long, nFeat: Int, isSparse: Boolean) = {
+      total: Long, nFeat: Int) = {
     // Now compute redundancy based on collisions and normalize it
     val factor = if($(discreteData)) Double.MinPositiveValue else 1.0
     val marginal = rawMarginal.mapActiveValues(_ /  (total * factor))

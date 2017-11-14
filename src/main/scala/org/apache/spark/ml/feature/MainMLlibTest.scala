@@ -38,6 +38,9 @@ import org.apache.spark.sql.Dataset
 import org.apache.spark.ml.linalg.DenseMatrix
 import org.apache.spark.ml.linalg.SparseVector
 import org.apache.spark.sql.functions._
+import org.apache.spark.mllib.regression.{LabeledPoint => OldLP}
+import org.apache.spark.mllib.linalg.{Vectors => OldVectors}
+
 
 
 /**
@@ -72,9 +75,10 @@ object MainMLlibTest {
   var format = "csv"
   var sparseSpeedup = 0
   var predict: Boolean = false
+  var savePreprocess: Boolean = false
   var sampling = 1.0f
-  
-  
+  var normalize: Boolean = false
+  var repartition: Boolean = false
   var mrmr: Boolean = false
   
   
@@ -85,13 +89,9 @@ object MainMLlibTest {
     
     val initStartTime = System.nanoTime()
     
-    val conf = new SparkConf().setAppName("CollisionFS Test").setMaster("local[*]").set("spark.driver.memory", "16g").set("spark.executor.memory", "16g")
+    val conf = new SparkConf().setAppName("CollisionFS Test").setMaster("spark://bigdata:7077")//.setMaster("local[*]").set("spark.driver.memory", "16g").set("spark.executor.memory", "16g")
     val sc = new SparkContext(conf)
     sqlContext = new SQLContext(sc)
-    
-    //val rand = new java.util.Random(seed)
-    //Array.fill(5) { DenseMatrix.randn(5, 30000000, rand) }
-    //val asd =  DenseMatrix.randn(5, 30000000, rand)
     println("Usage: MLlibTest --train-file=\"hdfs://blabla\" --nselect=10 --npart=1 --continuous=false --k=5 --ntop=10 --discretize=false --padded=2 --class-last=true --header=false")
         
     // Create a table of parameters (parsing)
@@ -114,6 +114,9 @@ object MainMLlibTest {
     nselect = params.getOrElse("nselect", "10").toInt
     continuous = params.getOrElse("continuous", "true").toBoolean
     predict = params.getOrElse("predict", "false").toBoolean
+    savePreprocess = params.getOrElse("savePreprocess", "false").toBoolean
+    repartition = params.getOrElse("repartition", "false").toBoolean
+    normalize = params.getOrElse("normalize", "false").toBoolean
     mrmr = params.getOrElse("mrmr", "false").toBoolean
     lowerFeatThreshold = params.getOrElse("lowerFeatThreshold", "3.0").toFloat
     numHashTables = params.getOrElse("numHashTables", "50").toInt
@@ -130,13 +133,11 @@ object MainMLlibTest {
     println("Params used: " +  params.mkString("\n"))
     
     val rawDF = TestHelper.readData(sqlContext, pathFile, firstHeader, format)
-        //.sample(false, sampling, seed)
-        .repartition(nPartitions)
-        .cache
-    rawDF.count()
-    val df = preProcess(rawDF).select(clsLabel, inputLabel).cache
-    df.count()
-    rawDF.unpersist()
+    val partDF = if(repartition) rawDF.repartition(nPartitions).cache else rawDF.cache
+    val df = preProcess(partDF).select(clsLabel, inputLabel).cache
+    println("# of examples readed and processed: " + df.count())
+    partDF.unpersist()
+       
     
     if(mode == "test-lsh"){
       this.testLSHPerformance(df)
@@ -520,8 +521,9 @@ object MainMLlibTest {
       
       val model = discretizer.fit(processedDF)
       processedDF = model.transform(processedDF)
+      
       continuous = false
-    } else if(continuous && format != "libsvm") {
+    } else if(normalize) {
       val scaler = new StandardScaler()
         .setInputCol(inputLabel)
         .setOutputCol("norm-" + inputLabel)
@@ -531,6 +533,18 @@ object MainMLlibTest {
       val smodel = scaler.fit(processedDF)
       processedDF = smodel.transform(processedDF)
       inputLabel = "norm-" + inputLabel
+    }
+    if(savePreprocess) {
+      processedDF.show
+      if(format == "csv"){
+        processedDF.select(clsLabel, inputLabel).rdd
+          .map{case Row(label: Double, features: Vector) => features.toArray.mkString(",") + "," + label}
+          .saveAsTextFile(pathFile + ".disc")
+      } else if (format == "libsvm") {
+        val output = processedDF.select(clsLabel, inputLabel).rdd
+              .map{case Row(label: Double, features: Vector) => OldLP(label, OldVectors.fromML(features))}
+        MLUtils.saveAsLibSVMFile(output, pathFile + ".disc")
+      }
     }
     processedDF
   }
@@ -627,7 +641,7 @@ object MainMLlibTest {
       .setBatchSize(batchSize)
       .setLowerFeatureThreshold(lowerFeatThreshold)
       .setQueryStep(queryStep)
-      .setDiscreteData(discretize || !continuous)
+      .setDiscreteData(!continuous)
     
     val now = System.currentTimeMillis
     val model = selector.fit(df)
