@@ -40,6 +40,8 @@ import org.apache.spark.ml.linalg.SparseVector
 import org.apache.spark.sql.functions._
 import org.apache.spark.mllib.regression.{LabeledPoint => OldLP}
 import org.apache.spark.mllib.linalg.{Vectors => OldVectors}
+import org.apache.spark.sql.types.StructField
+import org.apache.spark.ml.linalg.VectorUDT
 
 
 
@@ -110,7 +112,7 @@ object MainMLlibTest {
     padded = params.getOrElse("padded", "0").toInt
     classLastIndex = params.getOrElse("class-last", "false").toBoolean
     firstHeader = params.getOrElse("header", "false").toBoolean
-    k = params.getOrElse("k", "5").toInt
+    k = params.getOrElse("k", "20").toInt
     nselect = params.getOrElse("nselect", "10").toInt
     continuous = params.getOrElse("continuous", "true").toBoolean
     predict = params.getOrElse("predict", "false").toBoolean
@@ -518,10 +520,18 @@ object MainMLlibTest {
         .setOutputCol("disc-" + inputLabel)
         .setApproximate(true)
         
-      inputLabel = "disc-" + inputLabel
       val model = discretizer.fit(processedDF)
-      val discDF = model.transform(processedDF).cache()
-      println("Discretized data: " + discDF.count())
+      val rddModel = new org.apache.spark.mllib.feature.DiscretizerModel(model.splits)
+      val inputRDD = processedDF.select(inputLabel, clsLabel).rdd.map{case Row(v: Vector, l: Double) => OldVectors.fromML(v) -> l}
+      val discRDD = rddModel.transformRDD(inputRDD.map(_._1))
+          .zip(inputRDD.map(_._2))
+          .map{case (v, l) => Row(l, v.asML)}
+      
+      inputLabel = "disc-" + inputLabel
+      val schema = new StructType()
+            .add(StructField(clsLabel, DoubleType, true))
+            .add(StructField(inputLabel, new VectorUDT(), true))
+      val discDF = sqlContext.createDataFrame(discRDD, schema)
       processedDF = discDF      
       continuous = false
     } else if(normalize) {

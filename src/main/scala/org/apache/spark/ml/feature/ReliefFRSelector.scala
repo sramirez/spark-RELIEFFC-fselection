@@ -184,8 +184,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   def setSparseSpeedup(value: Double): this.type = set(sparseSpeedup, value)
   def setDiscreteData(value: Boolean): this.type = set(discreteData, value)
   
-  // Case class for criteria/feature
-  case class F(feat: Int, crit: Double)
   
   override def transformSchema(schema: StructType): StructType = {
     SchemaUtils.checkColumnType(schema, $(inputCol), new VectorUDT)
@@ -330,10 +328,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat)
     val rddFinalWeights = finalWeights.rdd.map{ case Row(k: Int, _, normScore: Float) => (k, normScore)}
     val (reliefCol, relief) = selectFeatures(rddFinalWeights, redundancyMatrix, nFeat)
-    val outRC = reliefCol.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
-    val outR = relief.map { case F(feat, rel) => (feat + 1) + "\t" + "%.4f".format(rel) }.mkString("\n")
-    println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
-    println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
+    val outRC = reliefCol.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
+    val outR = relief.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
+    println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\tRelevance\tRedundancy\n" + outRC)
+    println("\n*** RELIEF selected features ***\nFeature\tScore\tRelevance\tRedundancy\n" + outR)
     
     val model = new ReliefFRSelectorModel(uid, relief.map(_.feat).toArray, reliefCol.map(_.feat).toArray)
     copyValues(model)
@@ -684,13 +682,15 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     }
   }
 
+  // Case class for criteria/feature
+  case class F(feat: Int, crit: FeatureScore)
   
   def selectFeatures(reliefRanking: RDD[(Int, Float)],
       redundancyMatrix: BM[Double], nFeat: Int): (Seq[F], Seq[F]) = {
     
     // Initialize all (except the class) criteria with the relevance values
     val reliefNoColl = reliefRanking.takeOrdered($(numTopFeatures))(Ordering[(Double, Int)].on(f => (-f._2, f._1)))
-      .map{case (feat, crit) => F(feat, crit)}.toSeq
+      .map{case (feat, crit) => F(feat, new FeatureScore().init(crit.toFloat))}.toSeq
     val actualWeights = reliefRanking.mapValues{ score => new FeatureScore().init(score.toFloat)}.sortBy(_._1).collect()
     val pool: Array[Option[FeatureScore]] = Array.fill(nFeat)(None)
     actualWeights.foreach{case (id, score) => pool(id) = Some(score)}
@@ -732,7 +732,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       }
       
       if(maxi > -1){
-        selected = F(maxi, max.score) +: selected
+        selected = F(maxi, max) +: selected
         max.valid = false
       } else {
         moreFeat = false
@@ -741,7 +741,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     (selected.reverse, reliefNoColl)  
   }
   
-  private class FeatureScore extends Serializable {
+  class FeatureScore extends Serializable {
     var relevance: Float = 0.0f
     var redundance: Float = 0.0f
     var selectedSize: Int = 0
@@ -754,7 +754,11 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         relevance
       }
     }
-    
+    override def toString() = {
+      "%.4f".format(score) + "\t" +
+      "%.4f".format(relevance) + "\t" +
+      "%.4f".format(redundance)
+    }
     def init(relevance: Float): FeatureScore = {
       this.relevance = relevance
       this
@@ -797,6 +801,17 @@ final class ReliefFRSelectorModel private[ml] (
   def setInputCol(value: String): this.type = set(inputCol, value)
   def setRedundancyRemoval(value: Boolean): this.type = set(redundancyRemoval, value)
   
+  private var subset: Int = getSelectedFeatures().length
+  def setReducedSubset(s: Int) {
+    if(s > 0 && s < getSelectedFeatures().length){
+      subset = s
+    } else {
+      System.err.println("The number of features in the subset must" +
+        " be lower than the total number and greater than 0")
+    }
+  }
+  
+  def getReducedSubsetParam(): Int = subset
   def getSelectedFeatures(): Array[Int] = if($(redundancyRemoval)) reliefFeatures else reliefColFeatures
 
   override def transform(dataset: Dataset[_]): DataFrame = {
@@ -804,8 +819,8 @@ final class ReliefFRSelectorModel private[ml] (
     val newField = transformedSchema.last
 
     // TODO: Make the transformer natively in ml framework to avoid extra conversion.
-    val selectedFeatures = if($(redundancyRemoval)) reliefFeatures else reliefColFeatures
-    val transformer: Vector => Vector = v =>  FeatureSelectionUtils.compress(OldVectors.fromML(v), selectedFeatures).asML
+    val sfeat = getSelectedFeatures().slice(0, subset)
+    val transformer: Vector => Vector = v =>  FeatureSelectionUtils.compress(OldVectors.fromML(v), sfeat).asML
     val selector = udf(transformer)
 
     dataset.withColumn($(outputCol), selector(col($(inputCol))), newField.metadata)
