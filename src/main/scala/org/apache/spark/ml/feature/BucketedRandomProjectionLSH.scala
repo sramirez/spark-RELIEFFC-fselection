@@ -157,7 +157,13 @@ class BucketedRandomProjectionLSH(override val uid: String)
   override def setOutputCol(value: String): this.type = super.setOutputCol(value)
 
   @Since("2.1.0")
-  override def setNumHashTables(value: Int): this.type = super.setNumHashTables(value)
+  override def setNumHashTables(value: Int): this.type = super.setNumHashTables(value) 
+  
+  @Since("2.1.0")
+  override def setSignatureSize(value: Int): this.type = set(signatureSize, value)
+  
+  @Since("2.1.0")
+  override def setSparseSpeedup(value: Double): this.type = set(sparseSpeedup, value)
 
   @Since("2.1.0")
   def this() = {

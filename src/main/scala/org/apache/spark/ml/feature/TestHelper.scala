@@ -11,6 +11,10 @@ import org.apache.spark.ml.linalg.Vector
 import org.apache.spark.ml.util._
 import org.apache.spark.annotation.Experimental
 import org.apache.spark.annotation.Since
+import org.apache.spark.mllib.util.MLUtils
+import scala.collection.mutable.WrappedArray
+import org.apache.spark.ml.linalg.VectorUDT
+import org.apache.spark.mllib.linalg.{Vectors => OldVectors}
 
 /**
   * Loads various test datasets
@@ -69,11 +73,22 @@ object TestHelper {
   /** @return standard csv data from the repo.
     */
   def readData(sqlContext: SQLContext, file: String, header: Boolean = true, format: String = "csv"): DataFrame = {
-       val df = sqlContext.read.format(format)
-        .option("header", header.toString) // Use first line of all files as header
-        .option("inferSchema", "true") // Automatically infer data types
-        .load(FILE_PREFIX + file)
-       df
+      if(format == "libsvm"){
+        // patched till problems with multiple input paths are fixed
+        val rowRDD = MLUtils.loadLibSVMFile(sqlContext.sparkSession.sparkContext, FILE_PREFIX + file)
+            .map { l => Row(l.label, l.features.asML) }
+        val schema = new StructType()
+            .add(StructField("label", DoubleType, true))
+            .add(StructField("features", new VectorUDT(), true))
+        sqlContext.createDataFrame(rowRDD, schema)
+      } else {
+        val df = sqlContext.read.format(format)
+          .option("header", header.toString) // Use first line of all files as header
+          .option("inferSchema", "true") // Automatically infer data types
+          .load(FILE_PREFIX + file)
+        df 
+      }
+       
   }
   
   /** @return dataset with 3 double columns. The first is the label column and contain null.

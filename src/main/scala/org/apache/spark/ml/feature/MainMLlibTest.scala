@@ -76,7 +76,7 @@ object MainMLlibTest {
   var sparseSpeedup = 0
   var predict: Boolean = false
   var savePreprocess: Boolean = false
-  var sampling = 1.0f
+  var sampling = 100
   var normalize: Boolean = false
   var repartition: Boolean = false
   var mrmr: Boolean = false
@@ -128,7 +128,7 @@ object MainMLlibTest {
     mode = params.getOrElse("mode", "final")
     format = params.getOrElse("format", "csv")
     sparseSpeedup = params.getOrElse("sparseSpeedup", "0").toInt
-    sampling = params.getOrElse("sampling", "0.001f").toFloat
+    sampling = params.getOrElse("sampling", "100").toInt
     
     println("Params used: " +  params.mkString("\n"))
     
@@ -516,12 +516,13 @@ object MainMLlibTest {
         .setInputCol(inputLabel)
         .setLabelCol(clsLabel)
         .setOutputCol("disc-" + inputLabel)
+        .setApproximate(true)
         
       inputLabel = "disc-" + inputLabel
-      
       val model = discretizer.fit(processedDF)
-      processedDF = model.transform(processedDF)
-      
+      val discDF = model.transform(processedDF).cache()
+      println("Discretized data: " + discDF.count())
+      processedDF = discDF      
       continuous = false
     } else if(normalize) {
       val scaler = new StandardScaler()
@@ -535,7 +536,6 @@ object MainMLlibTest {
       inputLabel = "norm-" + inputLabel
     }
     if(savePreprocess) {
-      processedDF.show
       if(format == "csv"){
         processedDF.select(clsLabel, inputLabel).rdd
           .map{case Row(label: Double, features: Vector) => features.toArray.mkString(",") + "," + label}
@@ -580,6 +580,7 @@ object MainMLlibTest {
     
     val nFeat = df.select(inputLabel).head().getAs[Vector](0).size
     val nelems = df.count()
+    val kfold = 10
     
     val brp = new BucketedRandomProjectionLSH()
       .setNumHashTables(numHashTables)
@@ -590,10 +591,11 @@ object MainMLlibTest {
       .setSignatureSize(signatureSize)
       .setSparseSpeedup(sparseSpeedup)
       .setSeed(seed)
-   val model = brp.fit(df)
+   var model = brp.fit(df)
       
       // Sample only some elements to test
-    val keys = df.select(inputLabel).sample(false, sampling, seed).collect()
+    val samplingRate = sampling * kfold / nelems.toDouble // k-fold cross validation, k = 10
+    val keys = df.select(inputLabel).sample(false, samplingRate, seed).collect()
     println("Number of examples used in estimation: " + keys.length)
     
     var sumer = 0.0; var sump = 0.0; var sumr = 0.0; var red = 0L; var sumtime = 0.0; 
@@ -605,6 +607,8 @@ object MainMLlibTest {
       if(maxdist > maxd) 
         maxd = maxdist
       cont += 1
+      if(cont % kfold == 0)
+        model = brp.fit(df)
       println("# instances completed: " + cont)
     }
     println("Average precision: " + sump / keys.size)
