@@ -590,7 +590,7 @@ object MainMLlibTest {
     
     val nFeat = df.select(inputLabel).head().getAs[Vector](0).size
     val nelems = df.count()
-    val kfold = 10
+    val kfold = 3
     
     val brp = new BucketedRandomLSH()
       .setNumHashTables(numHashTables)
@@ -610,11 +610,9 @@ object MainMLlibTest {
     var sumer = 0.0; var sump = 0.0; var sumr = 0.0; var red = 0L; var sumtime = 0.0; 
     var sumMax = 0.0; var maxd = 0.0; var cont = 0
     keys.foreach { case Row(key: Vector) =>  
-      val (errorRatio, precision, recall, redundancy, time, maxdist) = LSHTest.calculateApproxNearestNeighbors(
+      val (errorRatio, precision, recall, redundancy, time) = LSHTest.calculateApproxNearestNeighbors(
           model, df, key, k, "multi", "distCol", nelems) 
-      sump += precision; sumr += recall; red += redundancy; sumtime += time; sumMax += maxdist; sumer += errorRatio
-      if(maxdist > maxd) 
-        maxd = maxdist
+      sump += precision; sumr += recall; sumtime += time; sumer += errorRatio
       cont += 1
       if(cont % kfold == 0)
         model = brp.fit(df)

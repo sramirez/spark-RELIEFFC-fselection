@@ -24,6 +24,7 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.DataTypes
 import org.apache.spark.sql.Row
 import org.apache.spark.ml.linalg.Vectors
+import scala.collection.mutable.WrappedArray
 
 private[ml] object LSHTest {
   /**
@@ -112,32 +113,26 @@ private[ml] object LSHTest {
 
     // Compute real neighbors
     val distUDF = udf((x: Vector) => model.keyDistance(x, key), DataTypes.DoubleType)
-    val distColumn = distUDF(col(model.getInputCol))
-    val modelDatasetWithDist = dataset.withColumn("realDist", distColumn).cache()
-    val quantile = modelDatasetWithDist.stat.approxQuantile("realDist", Array(math.min(1, k / nelems.toDouble)), 0.05)(0)
-    val expected = modelDatasetWithDist.filter(col("realDist").leq(quantile)).sort("realDist").limit(k).cache
-    //val expected2 = modelDatasetWithDist.sort("realDist").limit(k).cache
-    val nexpected = expected.count()
-    val farthestNeighbor = expected.sort(desc("realDist")).select(model.getInputCol).head().getAs[Vector](0)
-    val maxHashDist = math.sqrt(model.hashDistance(model.hashFunction(farthestNeighbor), model.hashFunction(key)))
+    val modelDatasetWithDist = dataset.withColumn("realDist", distUDF(col(model.getInputCol))).cache()
+    val quantile = modelDatasetWithDist.stat.approxQuantile("realDist", Array(math.min(1.0, k / nelems.toDouble)), 0.05)(0)
+    val expected = modelDatasetWithDist.filter(col("realDist").leq(quantile)).sort("realDist").limit(k).toDF().collect()
+    val nexpected = expected.length
     
     // Compute query time
     val s = System.currentTimeMillis()
-    val (redundancy, ractual) = model.approxNearestNeighbors(dataset, key, k, 
-        probeMode = probeMode, distCol, nelems)
-    val actual = ractual.cache()
-    val nactual = actual.count()
+    val actual = model.approxNearestNeighbors(dataset, key, k, 
+        probeMode = probeMode, distCol, nelems).toDF().collect()
+    val nactual = actual.length
     val queryTime = (System.currentTimeMillis() - s) / 1000 // in s
     
     // Compute precision and recall
-    val error = actual.select(distCol).collect().zip(expected.select("realDist")collect()).map{ 
-      case(Row(actualDist: Double), Row(expectedDist: Double)) =>
-        (actualDist + 1) / (expectedDist + 1)
+    val error = actual.zip(expected).map{ 
+      case(r1,r2) =>
+        (r1.getAs[Double](distCol) + 1) / (r2.getAs[Double]("realDist") + 1)
     }.sum
-    
-    val correctCount = expected.join(actual, model.getInputCol).count().toDouble
-    modelDatasetWithDist.unpersist(); actual.unpersist()
-    (error / math.min(nactual, nexpected), correctCount / nactual, correctCount / nexpected, redundancy, queryTime, maxHashDist)
+    val intputCol = model.getInputCol
+    val correctCount = expected.map { _.getAs[Vector](intputCol) }.intersect(actual.map{_.getAs[Vector](intputCol)}).length.toDouble
+    (error / math.min(nactual, nexpected), correctCount / nactual, correctCount / nexpected, 1.0, queryTime)
   }
 
   /**

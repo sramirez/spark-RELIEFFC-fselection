@@ -165,7 +165,7 @@ private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveH
       distCol: String,
       nelems: Long,
       relativeError: Double,
-      step: Int = 2): (Long, Dataset[_]) = {
+      step: Int = 2): Dataset[_] = {
     require(numNearestNeighbors > 0, "The number of nearest neighbors cannot be less than 1")
     // Get Hash Value of the key
     
@@ -176,7 +176,7 @@ private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveH
         dataset.toDF()
       }
 
-    val (filtered, modelSubset) = probeMode match {
+    val modelSubset = probeMode match {
       
       case "single" => 
         def sameBucket(x: Seq[Vector], y: Seq[Vector]): Boolean = {
@@ -187,31 +187,25 @@ private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveH
         val sameBucketWithKeyUDF = udf((x: Seq[Vector]) =>
           sameBucket(x, keyHash), DataTypes.BooleanType)
 
-        val filteredData = modelDataset.filter(sameBucketWithKeyUDF(col($(outputCol))))
-        (filteredData.count, filteredData)
+        modelDataset.filter(sameBucketWithKeyUDF(col($(outputCol))))
       case "multi" =>
         // In the origin dataset, find the hash value that is closest to the key
         val distanceFunction = if(step < 1) (x: Seq[Vector]) => hashDistance(x, keyHash) else 
           (x: Seq[Vector]) => hashThresholdedDistance(x, keyHash, step)
         val hashDistUDF = udf(distanceFunction, DataTypes.DoubleType)
-        val hashDistColumn = hashDistUDF(col($(outputCol)))
   
         // Compute threshold to get exact k elements.
-        val modelDatasetWithDist = modelDataset.withColumn(distCol, hashDistColumn)
-        val filteredData = modelDatasetWithDist.filter(col(distCol) < Float.PositiveInfinity).cache()
-        
-        // Filter the dataset where the hash value is less than the threshold.
-        (filteredData.count(), filteredData) 
+        modelDataset.withColumn(distCol, hashDistUDF(col($(outputCol))))
+            .filter(col(distCol) < Float.PositiveInfinity)
     }
 
     // Get the top k nearest neighbor by their distance to the key
     val keyDistUDF = udf((x: Vector) => keyDistance(x, key), DataTypes.DoubleType)
-    val modelSubsetWithDistCol = modelSubset.withColumn(distCol, keyDistUDF(col($(inputCol))))
-    val quantile = modelSubsetWithDistCol.stat
-          .approxQuantile(distCol, Array(math.min(numNearestNeighbors / filtered.toDouble, 1)), relativeError)(0)
-    val neighbors = modelSubsetWithDistCol.filter(col(distCol).leq(quantile))
-          .sort(distCol).limit(numNearestNeighbors)
-    (filtered, neighbors)
+    val modelSubsetWithDistCol = modelSubset.withColumn(distCol, keyDistUDF(col($(inputCol)))).cache()
+    val prob = math.min(1.0, numNearestNeighbors.toDouble / modelSubsetWithDistCol.count())
+    val quantile = modelSubsetWithDistCol.stat.approxQuantile(distCol, Array(prob), relativeError)(0)
+    val neighbors = modelSubsetWithDistCol.filter(col(distCol).leq(quantile)).sort(distCol).limit(numNearestNeighbors)
+    neighbors
   }
 
   private[feature] def approxNearestNeighbors(
@@ -220,7 +214,7 @@ private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveH
       numNearestNeighbors: Int,
       probeMode: String,
       distCol: String,
-      nelems: Long): (Long, Dataset[_]) = {
+      nelems: Long): Dataset[_] = {
     approxNearestNeighbors(dataset, key, numNearestNeighbors, probeMode, distCol, nelems, relativeError = 0.05)
   }
 
@@ -244,7 +238,7 @@ private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveH
       key: Vector,
       numNearestNeighbors: Int,
       distCol: String,
-      nelems: Long): (Long, Dataset[_]) = {
+      nelems: Long): Dataset[_] = {
     approxNearestNeighbors(dataset, key, numNearestNeighbors, "multi", distCol, nelems)
   }
 
@@ -255,7 +249,7 @@ private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveH
       dataset: Dataset[_],
       key: Vector,
       numNearestNeighbors: Int,
-      nelems: Long): (Long, Dataset[_]) = {
+      nelems: Long): Dataset[_] = {
     approxNearestNeighbors(dataset, key, numNearestNeighbors, "multi", "distCol", nelems)
   }
 
