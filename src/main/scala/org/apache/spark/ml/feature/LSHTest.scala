@@ -54,7 +54,7 @@ private[ml] object LSHTest {
    * @tparam T The class type of lsh
    * @return A tuple of two doubles, representing the false positive and false negative rate
    */
-  def calculateLSHProperty[T <: LSHModel[T]](
+  def calculateLSHProperty[T <: LocalitySensitiveHashingModel[T]](
       dataset: Dataset[_],
       lsh: LocalitySensitiveHashing[T],
       distFP: Double,
@@ -101,8 +101,8 @@ private[ml] object LSHTest {
    * @tparam T The class type of lsh
    * @return A tuple of two doubles, representing precision and recall rate
    */
-  def calculateApproxNearestNeighbors[T <: LSHModel[T]](
-      model: LSHModel[T],
+  def calculateApproxNearestNeighbors[T <: LocalitySensitiveHashingModel[T]](
+      model: LocalitySensitiveHashingModel[T],
       dataset: Dataset[_],
       key: Vector,
       k: Int,
@@ -149,7 +149,7 @@ private[ml] object LSHTest {
    * @tparam T The class type of lsh
    * @return A tuple of two doubles, representing precision and recall rate
    */
-  def calculateApproxSimilarityJoin[T <: LSHModel[T]](
+  def calculateApproxSimilarityJoin[T <: LocalitySensitiveHashingModel[T]](
       lsh: LocalitySensitiveHashing[T],
       datasetA: Dataset[_],
       datasetB: Dataset[_],

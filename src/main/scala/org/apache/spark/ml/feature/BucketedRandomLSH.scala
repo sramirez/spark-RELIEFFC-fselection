@@ -78,7 +78,7 @@ private[ml] trait BucketedRandomLSHParams extends Params {
 class BucketedRandomLSHModel private[ml](
     override val uid: String,
     private[ml] val randUnitVectors: Array[Array[Vector]])
-  extends LSHModel[BucketedRandomLSHModel] with BucketedRandomLSHParams {
+  extends LocalitySensitiveHashingModel[BucketedRandomLSHModel] with BucketedRandomLSHParams {
   
   override protected[ml] val hashFunction: Vector => Array[Vector] = {
     key: Vector => {

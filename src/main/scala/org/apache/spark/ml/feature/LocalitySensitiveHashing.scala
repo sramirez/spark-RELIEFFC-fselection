@@ -38,7 +38,7 @@ import org.apache.spark.ml.param.DoubleParam
 /**
  * Params for [[LSH]].
  */
-private[ml] trait LSHParams extends HasInputCol with HasOutputCol {
+private[ml] trait LocalitySensitiveHashingParams extends HasInputCol with HasOutputCol {
   /**
    * Param for the number of hash tables used in LSH OR-amplification.
    *
@@ -93,8 +93,8 @@ private[ml] trait LSHParams extends HasInputCol with HasOutputCol {
 /**
  * Model produced by [[LSH]].
  */
-private[ml] abstract class LSHModel[T <: LSHModel[T]]
-  extends Model[T] with LSHParams with MLWritable {
+private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveHashingModel[T]]
+  extends Model[T] with LocalitySensitiveHashingParams with MLWritable {
   self: T =>
   /**
    * The hash function of LSH, mapping an input feature vector to multiple hash vectors.
@@ -375,8 +375,8 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
  * (2) Wang, Jingdong et al. "Hashing for similarity search: A survey." arXiv preprint
  * arXiv:1408.2927 (2014).
  */
-private[ml] abstract class LocalitySensitiveHashing[T <: LSHModel[T]]
-  extends Estimator[T] with LSHParams with DefaultParamsWritable {
+private[ml] abstract class LocalitySensitiveHashing[T <: LocalitySensitiveHashingModel[T]]
+  extends Estimator[T] with LocalitySensitiveHashingParams with DefaultParamsWritable {
   self: Estimator[T] =>
 
   /** @group setParam */
