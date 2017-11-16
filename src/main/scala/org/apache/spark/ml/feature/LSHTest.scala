@@ -113,15 +113,15 @@ private[ml] object LSHTest {
 
     // Compute real neighbors
     val distUDF = udf((x: Vector) => model.keyDistance(x, key), DataTypes.DoubleType)
-    val modelDatasetWithDist = dataset.withColumn("realDist", distUDF(col(model.getInputCol))).cache()
-    val quantile = modelDatasetWithDist.stat.approxQuantile("realDist", Array(math.min(1.0, k / nelems.toDouble)), 0.05)(0)
-    val expected = modelDatasetWithDist.filter(col("realDist").leq(quantile)).sort("realDist").limit(k).toDF().collect()
+    val modelDatasetWithDist = dataset.withColumn("realDist", distUDF(col(model.getInputCol)))
+    implicit def rowOrder: Ordering[Row] = Ordering.by{_.getAs[Double]("realDist")}
+    val expected = modelDatasetWithDist.rdd.takeOrdered(k)(rowOrder)
     val nexpected = expected.length
     
     // Compute query time
     val s = System.currentTimeMillis()
     val actual = model.approxNearestNeighbors(dataset, key, k, 
-        probeMode = probeMode, distCol, nelems).toDF().collect()
+        probeMode = probeMode, distCol, nelems)
     val nactual = actual.length
     val queryTime = (System.currentTimeMillis() - s) / 1000 // in s
     

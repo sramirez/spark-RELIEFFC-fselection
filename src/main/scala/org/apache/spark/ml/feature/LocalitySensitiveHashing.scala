@@ -165,7 +165,7 @@ private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveH
       distCol: String,
       nelems: Long,
       relativeError: Double,
-      step: Int = 2): Dataset[_] = {
+      step: Int = 2): Array[Row] = {
     require(numNearestNeighbors > 0, "The number of nearest neighbors cannot be less than 1")
     // Get Hash Value of the key
     
@@ -201,10 +201,9 @@ private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveH
 
     // Get the top k nearest neighbor by their distance to the key
     val keyDistUDF = udf((x: Vector) => keyDistance(x, key), DataTypes.DoubleType)
-    val modelSubsetWithDistCol = modelSubset.withColumn(distCol, keyDistUDF(col($(inputCol)))).cache()
-    val prob = math.min(1.0, numNearestNeighbors.toDouble / modelSubsetWithDistCol.count())
-    val quantile = modelSubsetWithDistCol.stat.approxQuantile(distCol, Array(prob), relativeError)(0)
-    val neighbors = modelSubsetWithDistCol.filter(col(distCol).leq(quantile)).sort(distCol).limit(numNearestNeighbors)
+    val modelSubsetWithDistCol = modelSubset.withColumn(distCol, keyDistUDF(col($(inputCol))))
+    implicit def rowOrder: Ordering[Row] = Ordering.by{_.getAs[Double](distCol)}
+    val neighbors = modelSubsetWithDistCol.rdd.takeOrdered(numNearestNeighbors)(rowOrder)
     neighbors
   }
 
@@ -214,7 +213,7 @@ private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveH
       numNearestNeighbors: Int,
       probeMode: String,
       distCol: String,
-      nelems: Long): Dataset[_] = {
+      nelems: Long): Array[Row] = {
     approxNearestNeighbors(dataset, key, numNearestNeighbors, probeMode, distCol, nelems, relativeError = 0.05)
   }
 
@@ -238,7 +237,7 @@ private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveH
       key: Vector,
       numNearestNeighbors: Int,
       distCol: String,
-      nelems: Long): Dataset[_] = {
+      nelems: Long): Array[Row] = {
     approxNearestNeighbors(dataset, key, numNearestNeighbors, "multi", distCol, nelems)
   }
 
@@ -249,7 +248,7 @@ private[ml] abstract class LocalitySensitiveHashingModel[T <: LocalitySensitiveH
       dataset: Dataset[_],
       key: Vector,
       numNearestNeighbors: Int,
-      nelems: Long): Dataset[_] = {
+      nelems: Long): Array[Row] = {
     approxNearestNeighbors(dataset, key, numNearestNeighbors, "multi", "distCol", nelems)
   }
 
