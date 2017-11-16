@@ -199,7 +199,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     // Get Hash Value of the key 
     val hashOutputCol = "hashRELIEF_" + System.currentTimeMillis()
-    val brp = new BucketedRandomProjectionLSH()
+    val brp = new BucketedRandomLSH()
       .setInputCol($(inputCol))
       .setOutputCol(hashOutputCol)
       .setSparseSpeedup($(sparseSpeedup))
@@ -369,9 +369,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             val Row(inputNeig: Vector, hashNeig: WrappedArray[Vector]) = it.next
             (0 until query.size).foreach { j => 
                val Row(_, inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
-               val hdist = BucketedRandomProjectionLSH.hashThresholdedDistance(hashQuery.array, hashNeig.array, qstep)
+               val hdist = BucketedRandomLSH.hashThresholdedDistance(hashQuery.array, hashNeig.array, qstep)
                if(hdist < Double.PositiveInfinity) {
-                 val distance = BucketedRandomProjectionLSH.keyDistance(inputQuery, inputNeig)
+                 val distance = BucketedRandomLSH.keyDistance(inputQuery, inputNeig)
                  neighbors(j)._2 += distance.toFloat -> Localization(pindex.toShort, i)
                }  
             }

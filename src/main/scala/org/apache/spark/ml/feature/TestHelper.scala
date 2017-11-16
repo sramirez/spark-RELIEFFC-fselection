@@ -76,7 +76,7 @@ object TestHelper {
       if(format == "libsvm"){
         // patched till problems with multiple input paths are fixed
         val rowRDD = MLUtils.loadLibSVMFile(sqlContext.sparkSession.sparkContext, FILE_PREFIX + file)
-            .map { l => Row(l.label, l.features.asML) }
+            .map { l => Row(l.label, l.features.toSparse.asML) }
         val schema = new StructType()
             .add(StructField("label", DoubleType, true))
             .add(StructField("features", new VectorUDT(), true))

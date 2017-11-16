@@ -135,7 +135,7 @@ object MainMLlibTest {
     println("Params used: " +  params.mkString("\n"))
     
     val rawDF = TestHelper.readData(sqlContext, pathFile, firstHeader, format)
-    val partDF = if(repartition) rawDF.repartition(nPartitions).cache else rawDF.cache
+    val partDF = if(repartition) rawDF.repartition(nPartitions).cache else rawDF.coalesce(nPartitions).cache
     val df = preProcess(partDF).select(clsLabel, inputLabel).cache
     println("# of examples readed and processed: " + df.count())
     partDF.unpersist()
@@ -485,23 +485,23 @@ object MainMLlibTest {
     println("Indexed Schema: " + typedDF.schema)
     
     // Clean Label Column
-    val cleanedDF = TestHelper.cleanLabelCol(typedDF, clsLabel)
+    /*val cleanedDF = TestHelper.cleanLabelCol(typedDF, clsLabel)
     clsLabel = clsLabel + TestHelper.INDEX_SUFFIX
-    println("clslabel: " + clsLabel)
+    println("clslabel: " + clsLabel)*/
     
     // Assemble all input features
     var processedDF = if(newNames.size > 1){
       val featureAssembler = new VectorAssembler()
         .setInputCols(newNames)
         .setOutputCol(inputLabel)
-      featureAssembler.transform(cleanedDF).select(clsLabel, inputLabel)
+      featureAssembler.transform(typedDF).select(clsLabel, inputLabel)
     } else {
-      cleanedDF.select(clsLabel, inputLabel)
+      typedDF.select(clsLabel, inputLabel)
     }
     
     // If format is not csv and most of instances are sparse, then all are transformed to sparse
-    val majoritySparse = processedDF.rdd.map{case Row(cls: Double, features: Vector) => 
-      features.isInstanceOf[SparseVector]}.countByValue().max._1 && format != "csv"
+    val majoritySparse = if(format == "csv") false else processedDF.rdd.map{case Row(cls: Double, features: Vector) => 
+      features.isInstanceOf[SparseVector]}.countByValue().max._1 
     val standarizeTypeUDF = udf((feat: Vector) => if(majoritySparse) feat.toSparse else feat.toDense)
     processedDF = processedDF.withColumn(inputLabel, standarizeTypeUDF(col(inputLabel)))
     println("clsLabel: " + clsLabel)
@@ -592,11 +592,10 @@ object MainMLlibTest {
     val nelems = df.count()
     val kfold = 10
     
-    val brp = new BucketedRandomProjectionLSH()
+    val brp = new BucketedRandomLSH()
       .setNumHashTables(numHashTables)
       .setInputCol(inputLabel)
       .setOutputCol("hashCol")
-      .setNumHashTables(numHashTables)
       .setBucketLength(bucketWidth)
       .setSignatureSize(signatureSize)
       .setSparseSpeedup(sparseSpeedup)
@@ -621,6 +620,7 @@ object MainMLlibTest {
         model = brp.fit(df)
       println("# instances completed: " + cont)
     }
+    
     println("Average precision: " + sump / keys.size)
     println("Average recall: " + sumr / keys.size)
     println("Average selectivity: " + red / keys.size)

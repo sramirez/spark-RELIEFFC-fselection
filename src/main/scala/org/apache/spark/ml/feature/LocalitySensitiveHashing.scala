@@ -208,7 +208,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
     val keyDistUDF = udf((x: Vector) => keyDistance(x, key), DataTypes.DoubleType)
     val modelSubsetWithDistCol = modelSubset.withColumn(distCol, keyDistUDF(col($(inputCol))))
     val quantile = modelSubsetWithDistCol.stat
-          .approxQuantile(distCol, Array(numNearestNeighbors / filtered.toDouble), relativeError)(0)
+          .approxQuantile(distCol, Array(math.min(numNearestNeighbors / filtered.toDouble, 1)), relativeError)(0)
     val neighbors = modelSubsetWithDistCol.filter(col(distCol).leq(quantile))
           .sort(distCol).limit(numNearestNeighbors)
     (filtered, neighbors)
@@ -375,7 +375,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
  * (2) Wang, Jingdong et al. "Hashing for similarity search: A survey." arXiv preprint
  * arXiv:1408.2927 (2014).
  */
-private[ml] abstract class LSH[T <: LSHModel[T]]
+private[ml] abstract class LocalitySensitiveHashing[T <: LSHModel[T]]
   extends Estimator[T] with LSHParams with DefaultParamsWritable {
   self: Estimator[T] =>
 

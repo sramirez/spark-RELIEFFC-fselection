@@ -56,7 +56,7 @@ private[ml] object LSHTest {
    */
   def calculateLSHProperty[T <: LSHModel[T]](
       dataset: Dataset[_],
-      lsh: LSH[T],
+      lsh: LocalitySensitiveHashing[T],
       distFP: Double,
       distFN: Double): (Double, Double) = {
     val model = lsh.fit(dataset)
@@ -114,7 +114,7 @@ private[ml] object LSHTest {
     val distUDF = udf((x: Vector) => model.keyDistance(x, key), DataTypes.DoubleType)
     val distColumn = distUDF(col(model.getInputCol))
     val modelDatasetWithDist = dataset.withColumn("realDist", distColumn).cache()
-    val quantile = modelDatasetWithDist.stat.approxQuantile("realDist", Array(k / nelems.toDouble), 0.05)(0)
+    val quantile = modelDatasetWithDist.stat.approxQuantile("realDist", Array(math.min(1, k / nelems.toDouble)), 0.05)(0)
     val expected = modelDatasetWithDist.filter(col("realDist").leq(quantile)).sort("realDist").limit(k).cache
     //val expected2 = modelDatasetWithDist.sort("realDist").limit(k).cache
     val nexpected = expected.count()
@@ -137,7 +137,7 @@ private[ml] object LSHTest {
     
     val correctCount = expected.join(actual, model.getInputCol).count().toDouble
     modelDatasetWithDist.unpersist(); actual.unpersist()
-    (error / (nactual * nexpected), correctCount / nactual, correctCount / nexpected, redundancy, queryTime, maxHashDist)
+    (error / math.min(nactual, nexpected), correctCount / nactual, correctCount / nexpected, redundancy, queryTime, maxHashDist)
   }
 
   /**
@@ -150,7 +150,7 @@ private[ml] object LSHTest {
    * @return A tuple of two doubles, representing precision and recall rate
    */
   def calculateApproxSimilarityJoin[T <: LSHModel[T]](
-      lsh: LSH[T],
+      lsh: LocalitySensitiveHashing[T],
       datasetA: Dataset[_],
       datasetB: Dataset[_],
       threshold: Double): (Double, Double) = {
