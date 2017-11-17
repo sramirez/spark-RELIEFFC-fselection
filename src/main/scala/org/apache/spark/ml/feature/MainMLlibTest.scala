@@ -55,7 +55,6 @@ object MainMLlibTest {
   var pathFile = "test_lung_s3.csv"
   var order = -1 // Note: -1 means descending
   var nPartitions = 1
-  var nTop = 10
   var discretize = false
   var padded = 2
   var classLastIndex = false
@@ -67,6 +66,7 @@ object MainMLlibTest {
   var nselect: Int = 10
   var seed = 12345678L
   var lowerFeatThreshold = 0.5
+  var lowerDistanceThreshold = 0.8
   var numHashTables = 100
   var bucketWidth = 4
   var signatureSize = 5
@@ -91,10 +91,10 @@ object MainMLlibTest {
     
     val initStartTime = System.nanoTime()
     
-    val conf = new SparkConf().setAppName("CollisionFS Test").setMaster("local[*]")//.setMaster("local[*]").set("spark.driver.memory", "16g").set("spark.executor.memory", "16g")
+    val conf = new SparkConf().setAppName("CollisionFS Test").setMaster("local[*]").set("spark.driver.memory", "16g").set("spark.executor.memory", "16g")
     val sc = new SparkContext(conf)
     sqlContext = new SQLContext(sc)
-    println("Usage: MLlibTest --train-file=\"hdfs://blabla\" --nselect=10 --npart=1 --continuous=false --k=5 --ntop=10 --discretize=false --padded=2 --class-last=true --header=false")
+    println("Usage: MLlibTest --train-file=\"hdfs://blabla\" --nselect=10 --npart=1 --continuous=false --k=5 --discretize=false --padded=2 --class-last=true --header=false")
         
     // Create a table of parameters (parsing)
     val params = args.map{ arg =>
@@ -107,12 +107,11 @@ object MainMLlibTest {
     
     pathFile = params.getOrElse("train-file", "src/test/resources/data/test_lung_s3.csv")
     nPartitions = params.getOrElse("npart", "1").toInt
-    nTop = params.getOrElse("ntop", "10").toInt
     discretize = params.getOrElse("disc", "false").toBoolean
     padded = params.getOrElse("padded", "0").toInt
     classLastIndex = params.getOrElse("class-last", "false").toBoolean
     firstHeader = params.getOrElse("header", "false").toBoolean
-    k = params.getOrElse("k", "20").toInt
+    k = params.getOrElse("k", "5").toInt
     nselect = params.getOrElse("nselect", "10").toInt
     continuous = params.getOrElse("continuous", "true").toBoolean
     predict = params.getOrElse("predict", "false").toBoolean
@@ -121,6 +120,7 @@ object MainMLlibTest {
     normalize = params.getOrElse("normalize", "false").toBoolean
     mrmr = params.getOrElse("mrmr", "false").toBoolean
     lowerFeatThreshold = params.getOrElse("lowerFeatThreshold", "3.0").toFloat
+    lowerDistanceThreshold = params.getOrElse("lowerDistanceThreshold", "0.8").toFloat
     numHashTables = params.getOrElse("numHashTables", "50").toInt
     bucketWidth = params.getOrElse("bucketWidth", "12").toInt
     signatureSize = params.getOrElse("signatureSize", "5").toInt
@@ -135,16 +135,16 @@ object MainMLlibTest {
     println("Params used: " +  params.mkString("\n"))
     
     val rawDF = TestHelper.readData(sqlContext, pathFile, firstHeader, format)
-    val partDF = if(repartition) rawDF.repartition(nPartitions).cache else rawDF.coalesce(nPartitions).cache
+    val partDF = if(repartition) rawDF.repartition(nPartitions).cache else rawDF.coalesce(nPartitions)
     val df = preProcess(partDF).select(clsLabel, inputLabel).cache
-    println("# of examples readed and processed: " + df.count())
-    partDF.unpersist()
+    val nelems = df.count()
+    println("# of examples readed and processed: " + nelems)
        
     
     if(mode == "test-lsh"){
-      this.testLSHPerformance(df)
+      this.testLSHPerformance(df, nelems)
     } else if(mode == "final") {
-      testFinalSelector(df)
+      testFinalSelector(df, nelems)
     } else {
       doRELIEFComparison(df)
     }
@@ -507,7 +507,6 @@ object MainMLlibTest {
     println("clsLabel: " + clsLabel)
     println("Columns: " + processedDF.columns.mkString(","))
     println("Schema: " + processedDF.schema.toString)
-    processedDF.show()
       
     if(discretize) {
       // Continuous data from LIBSVM has to be discretized since
@@ -586,10 +585,9 @@ object MainMLlibTest {
     selector.fit(df)
   }
   
-  def testLSHPerformance(df: Dataset[_]) {
+  def testLSHPerformance(df: Dataset[_], nelems: Long) {
     
     val nFeat = df.select(inputLabel).head().getAs[Vector](0).size
-    val nelems = df.count()
     val kfold = 3
     
     val brp = new BucketedRandomLSH()
@@ -632,11 +630,10 @@ object MainMLlibTest {
     
   }
   
-  def testFinalSelector(df: Dataset[Row]) {
+  def testFinalSelector(df: Dataset[Row], nElems: Long) {
     
     val nFeat = df.head().getAs[Vector](inputLabel).size
     println("Total features: " + nFeat)
-    val nelems = df.count()
     
     val selector = new ReliefFRSelector()
       .setInputCol(inputLabel)
@@ -652,6 +649,7 @@ object MainMLlibTest {
       .setEstimationRatio(estimationRatio)
       .setBatchSize(batchSize)
       .setLowerFeatureThreshold(lowerFeatThreshold)
+      .setLowerDistanceThreshold(lowerDistanceThreshold)
       .setQueryStep(queryStep)
       .setDiscreteData(!continuous)
     

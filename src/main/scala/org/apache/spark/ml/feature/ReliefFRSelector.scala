@@ -50,6 +50,7 @@ import breeze.generic.UFunc
 import breeze.generic.MappingUFunc
 import breeze.linalg.support._
 import scala.collection.immutable.HashSet
+import org.apache.spark.util.SizeEstimator
 
 /**
  * Params for [[ReliefFRSelector]] and [[ReliefFRSelectorModel]].
@@ -73,7 +74,7 @@ private[feature] trait ReliefFRSelectorParams extends Params
    */
   final val numHashTables: IntParam = new IntParam(this, "numHashTables", "number of hash " +
     "tables, where increasing number of hash tables lowers the false negative rate, and " +
-    "decreasing it improves the running performance", ParamValidators.gt(0))
+    "decreasing it improves the running performance", ParamValidators.gtEq(0))
 
   /** @group getParam */
   final def getNumHashTables: Int = $(numHashTables)
@@ -148,14 +149,15 @@ private[feature] trait ReliefFRSelectorParams extends Params
   final val lowerFeatureThreshold: DoubleParam = new DoubleParam(this, "lowerFeatureThreshold", "", ParamValidators.gtEq(1))
   setDefault(lowerFeatureThreshold -> 3.0)
   
+  final val lowerDistanceThreshold: DoubleParam = new DoubleParam(this, "lowerDistanceThreshold", "", ParamValidators.inRange(0,1))
+  setDefault(lowerDistanceThreshold -> 0.8)
+  
   final val redundancyRemoval: BooleanParam = new BooleanParam(this, "redundancyRemoval", "")
   setDefault(redundancyRemoval -> true)
   
   final val discreteData: BooleanParam = new BooleanParam(this, "discreteData", "")
   setDefault(discreteData -> false)
   
-  
-
 }
 
 /**
@@ -171,18 +173,21 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   def setLabelCol(value: String): this.type = set(labelCol, value)
   def setInputCol(value: String): this.type = set(inputCol, value)
   def setSeed(value: Long): this.type = set(seed, value)
+  def setDiscreteData(value: Boolean): this.type = set(discreteData, value)
+  /** @group LSH params */
   def setNumHashTables(value: Int): this.type = set(numHashTables, value)
   def setSignatureSize(value: Int): this.type = set(signatureSize, value)  
   def setBucketLength(value: Double): this.type = set(bucketLength, value)
+  def setQueryStep(value: Int): this.type = set(queryStep, value) 
+  def setSparseSpeedup(value: Double): this.type = set(sparseSpeedup, value)
+  /** @group RELIEF params */
   def setNumTopFeatures(value: Int): this.type = set(numTopFeatures, value)
   def setNumNeighbors(value: Int): this.type = set(numNeighbors, value)
   def setEstimationRatio(value: Double): this.type = set(estimationRatio, value)
   def setBatchSize(value: Double): this.type = set(batchSize, value)
-  def setQueryStep(value: Int): this.type = set(queryStep, value) 
   def setLowerFeatureThreshold(value: Double): this.type = set(lowerFeatureThreshold, value)
+  def setLowerDistanceThreshold(value: Double): this.type = set(lowerDistanceThreshold, value)
   def setRedundancyRemoval(value: Boolean): this.type = set(redundancyRemoval, value)
-  def setSparseSpeedup(value: Double): this.type = set(sparseSpeedup, value)
-  def setDiscreteData(value: Boolean): this.type = set(discreteData, value)
   
   
   override def transformSchema(schema: StructType): StructType = {
@@ -195,29 +200,32 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   override def fit(dataset: Dataset[_]): ReliefFRSelectorModel = {
     
     transformSchema(dataset.schema, logging = true)
-    val now = System.currentTimeMillis
     
     // Get Hash Value of the key 
     val hashOutputCol = "hashRELIEF_" + System.currentTimeMillis()
-    val brp = new BucketedRandomLSH()
-      .setInputCol($(inputCol))
-      .setOutputCol(hashOutputCol)
-      .setSparseSpeedup($(sparseSpeedup))
-      .setNumHashTables($(numHashTables))
-      .setBucketLength($(bucketLength))
-      .setSignatureSize($(signatureSize))
-      .setSeed($(seed))
-    val LSHmodel = brp.fit(dataset)
-    
-    // Generate hash code for the complete dataset
-    val modelDataset: DataFrame = if (!dataset.columns.contains(hashOutputCol)) {
-        LSHmodel.transform(dataset).cache()
-      } else {
-        dataset.toDF()
-      }
-    
-    val hashRuntime = (System.currentTimeMillis - now) / 1000
-    logInfo("Hash model trained and hashes computed in " + hashRuntime + "s")
+    val modelDataset: DataFrame = if($(numHashTables) > 0){
+      val now = System.currentTimeMillis
+      val brp = new BucketedRandomLSH()
+        .setInputCol($(inputCol))
+        .setOutputCol(hashOutputCol)
+        .setSparseSpeedup($(sparseSpeedup))
+        .setNumHashTables($(numHashTables))
+        .setBucketLength($(bucketLength))
+        .setSignatureSize($(signatureSize))
+        .setSeed($(seed))
+      val LSHmodel = brp.fit(dataset)
+      val hashRuntime = (System.currentTimeMillis - now) / 1000
+      logInfo("Hash model trained in " + hashRuntime + "s")
+      
+      // Generate hash code for the complete dataset
+      if (!dataset.columns.contains(hashOutputCol)) {
+          LSHmodel.transform(dataset).cache()
+        } else {
+          dataset.toDF()
+        }  
+    } else {
+      dataset.toDF()
+    }
     
     // Get some basic information about the dataset
     val sc = dataset.sparkSession.sparkContext
@@ -226,7 +234,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val first = modelDataset.head().getAs[Vector]($(inputCol))
     val sparse = first.isInstanceOf[SparseVector]
     val nFeat = first.size
-    val probQuantile = 1 - math.min(1.0, $(lowerFeatureThreshold) * $(numTopFeatures) / nFeat.toDouble) // 0 is the min, 0.5 the median
+    val lowerFeat = math.max($(numTopFeatures), math.round($(lowerFeatureThreshold).toFloat * $(numTopFeatures))) // 0 is the min, 0.5 the median
     val priorClass = modelDataset.select($(labelCol)).rdd.map{ case Row(label: Double) => label }
         .countByValue()
         .mapValues(v => (v.toDouble / nElems).toFloat)
@@ -235,13 +243,12 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val schema = new StructType()
             .add(StructField("id2", IntegerType, true))
             .add(StructField("score2", FloatType, true))
-    val weights = Array.fill((1 / $(batchSize)).toInt)($(estimationRatio) * $(batchSize))
-    val batches = modelDataset.randomSplit(weights, $(seed))
+    val weights = Array.fill((1 / $(batchSize)).toInt)($(batchSize))
+    val batches = modelDataset.sample(false, $(estimationRatio)).randomSplit(weights, $(seed))
     var featureWeights: BV[Float] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
     var jointMatrix: BM[Double] = if (sparse) CSCMatrix.zeros(nFeat, nFeat) else BM.zeros(nFeat, nFeat) 
     var marginalVector: BV[Double] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
     var topFeatures: Set[Int] = Set.empty
-    
     var total = 0L // total number of comparisons at the collision level
     val results: Array[Dataset[_]] = Array.fill(batches.size)(spark.emptyDataFrame)
     var finalWeights: Dataset[_] = spark.emptyDataFrame
@@ -249,24 +256,21 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         
     for(i <- 0 until batches.size) {
       val start = System.currentTimeMillis
-      val query = batches(i)
-      val modelQuery: DataFrame = if (!query.columns.contains(hashOutputCol)) {
-        LSHmodel.transform(query)
-      } else {
-        query.toDF()
-      }  
-      modelQuery.show
       // Index query objects and compute the table that indicates where are located its neighbors
-      val idxModelQuery = modelQuery.withColumn("UniqueID", monotonically_increasing_id).cache
-      val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(idxModelQuery.select(
-          col("UniqueID"), col($(inputCol)), col($(labelCol)), col(hashOutputCol)).collect())
+      val idxModelQuery = batches(i).withColumn("UniqueID", monotonically_increasing_id).cache()
+      val query = if ($(numHashTables) > 0) idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)), col(hashOutputCol)) else
+            idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)))
+      val lquery = query.collect()
+      println("size: " + lquery.length)
+      logInfo("Estimated size for broadcasted query: " + SizeEstimator.estimate(lquery)) 
+      val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(lquery)
           
       val neighbors: RDD[(Long, Map[Short, Iterable[Int]])] = approxNNByPartition(idxModelQuery, 
           bFullQuery, $(numNeighbors) * priorClass.size, hashOutputCol)
       
       val bNeighborsTable: Broadcast[Map[Long, Map[Short, Iterable[Int]]]] = 
           sc.broadcast(neighbors.collectAsMap().toMap)
-      println("neighbors: " + bNeighborsTable.value.mkString(","))   
+      
       val (rawWeights: RDD[(Int, Float)], partialJoint, partialMarginal, partialCount, skipped) = 
         if(sparse) computeReliefWeightsSparse(
             idxModelQuery.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
@@ -279,10 +283,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       results(i) = spark.createDataFrame(rawWeights.map{ case(k,v) => Row(k,v) }, schema).cache()   
       if(results(i).count > 0){ // call the action required to persist data
         val normalized = normalizeRankingDF(results(i))
-        normalized.show
-        val quantile = normalized.stat.approxQuantile("score2", Array(probQuantile), 0.05)(0)
-        topFeatures = normalized.filter(normalized.col("score2").geq(quantile)).collect().map { 
-            case Row(id: Int, _) => id}.toSet
+        implicit def scoreOrder: Ordering[Row] = Ordering.by{ _.getAs[Float]("score2") }
+        topFeatures = normalized.rdd.takeOrdered(lowerFeat)(scoreOrder.reverse).map { _.getAs[Int]("id2") }.toSet
       }
         
       // Partial statistics for redundancy and others
@@ -318,15 +320,13 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val maxRelief = stats.getAs[Float](0); val minRelief = stats.getAs[Float](1)
     val normalizeUDF = udf((x: Float) => (x - minRelief) / (maxRelief - minRelief), DataTypes.FloatType)
     finalWeights = finalWeights.withColumn("norm-score", normalizeUDF(col("score")))
-    finalWeights.show
     
     // Unpersist partial results
     (0 until batches.size).foreach(i => results(i).unpersist())
-    //bLSHModel.destroy()
-
+    
     // normalized redundancy
     val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat)
-    val rddFinalWeights = finalWeights.rdd.map{ case Row(k: Int, _, normScore: Float) => (k, normScore)}
+    val rddFinalWeights = finalWeights.rdd.map{ case Row(k: Int, _, normScore: Float) => (k, normScore)}.cache()
     val (reliefCol, relief) = selectFeatures(rddFinalWeights, redundancyMatrix, nFeat)
     val outRC = reliefCol.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
     val outR = relief.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
@@ -343,6 +343,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       val normalizeUDF = udf((x: Float) => (x - minRelief) / (maxRelief - minRelief), DataTypes.FloatType)
       partialWeights.withColumn("score2", normalizeUDF(col("score2")))
   }  
+  
   // TODO: Fix the MultiProbe NN Search in SPARK-18454
   private def approxNNByPartition(
       modelDataset: Dataset[_],
@@ -353,27 +354,36 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     case class Localization(part: Short, index: Int)
     val sc = modelDataset.sparkSession.sparkContext
     val qstep = $(queryStep)
+    val lshOn = $(numHashTables) > 0
+    val input = if(lshOn) modelDataset.select($(inputCol), hashCol) else modelDataset.select($(inputCol))
+    val icol = $(inputCol)
     
-    val neighbors = modelDataset.select($(inputCol), hashCol).rdd.mapPartitionsWithIndex { 
-        case (pindex, it) => 
+    val neighbors = input.rdd.mapPartitionsWithIndex { 
+      case (pindex, it) => 
           // Initialize the map composed by the priority queue and the central element's ID
           val query = bModelQuery.value // Fields: "UniqueID", $(inputCol), $(labelCol), "hashOutputCol"
           val ordering = Ordering[Float].on[(Float, Localization)](_._1).reverse// BPQ needs reverse ordering   
-          val neighbors = query.map { case Row(id: Long, _, _, _) => 
-            id -> new BoundedPriorityQueue[(Float, Localization)](k)(ordering)
-          }   
+          val neighbors = query.map { r => r.getAs[Long]("UniqueID") -> new BoundedPriorityQueue[(Float, Localization)](k)(ordering) }   
       
           var i = 0
           // First iterate over the local elements, and then over the sampled set (also called query set).
           while(it.hasNext) {
-            val Row(inputNeig: Vector, hashNeig: WrappedArray[Vector]) = it.next
-            (0 until query.size).foreach { j => 
-               val Row(_, inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
-               val hdist = BucketedRandomLSH.hashThresholdedDistance(hashQuery.array, hashNeig.array, qstep)
-               if(hdist < Double.PositiveInfinity) {
-                 val distance = BucketedRandomLSH.keyDistance(inputQuery, inputNeig)
-                 neighbors(j)._2 += distance.toFloat -> Localization(pindex.toShort, i)
-               }  
+            if(lshOn) {
+              val Row(inputNeig: Vector, hashNeig: WrappedArray[Vector]) = it.next
+              (0 until query.size).foreach { j => 
+                 val Row(_, inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
+                 val hdist = BucketedRandomLSH.hashThresholdedDistance(hashQuery.array, hashNeig.array, qstep)
+                 if(hdist < Double.PositiveInfinity) {
+                   val distance = BucketedRandomLSH.keyDistance(inputQuery, inputNeig).toFloat
+                   neighbors(j)._2 += distance -> Localization(pindex.toShort, i)
+                 }    
+               }
+            } else {
+              val inputNeig = it.next.getAs[Vector](icol)
+              (0 until query.size).foreach { j => 
+                 val distance = BucketedRandomLSH.keyDistance(query(j).getAs[Vector](icol), inputNeig).toFloat
+                 neighbors(j)._2 += distance -> Localization(pindex.toShort, i)    
+               }
             }
             i += 1              
           }            
@@ -403,14 +413,11 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val label2Num = priorClass.zipWithIndex.map{case (k, v) => k._1 -> v.toShort}
     val idxPriorClass = priorClass.zipWithIndex.map{case (k, v) => v -> k._2}
     val bTF = sc.broadcast(topFeatures)
-    val isCont = !$(discreteData)
-    val lowerDistanceTh = .8f
+    val isCont = !$(discreteData); val lowerDistanceTh = $(lowerDistanceThreshold); val icol = $(inputCol); val lcol = $(labelCol)
     
     val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { 
       case(pindex, it) =>
         val localExamples = it.toArray
-        val query: Array[Row] = bModelQuery.value
-        val table: Map[Long, Map[Short, Iterable[Int]]] = bNeighborsTable.value
         // last position is reserved to negative weights from central instances.
         val marginal = BDV.zeros[Double](nFeat)        
         val joint = BDM.zeros[Double](nFeat, nFeat)
@@ -423,13 +430,16 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         val jointVote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else 
                       (i1: Int, _: Int) => pcounter(i1)
                       
-        query.map{ case Row(qid: Long, qinput: Vector, qlabel: Double, _) =>
-            
-            table.get(qid) match { 
+        bModelQuery.value.map{ row =>
+            val qid = row.getAs[Long]("UniqueID"); val qinput = row.getAs[Vector](icol); val qlabel = row.getAs[Double](lcol)
+            bNeighborsTable.value.get(qid) match { 
               case Some(localMap) =>
                 localMap.get(pindex.toShort) match {
                   case Some(neighbors) =>
-                    
+                    var mainLoop = 0L
+                    var extraLoop = 0L
+                    var totalTime = 0L
+                    val nowtotal = System.currentTimeMillis()
                     val rnumber = r.nextFloat()
                     val distanceThreshold = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
                     val localRelief = BDM.zeros[Double](nFeat, label2Num.size); val classCounter = BDV.zeros[Long](label2Num.size)
@@ -473,25 +483,33 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                         
                           mainCollisioned.clear(); auxCollisioned.clear()
                         }
+                        mainLoop += System.currentTimeMillis() - nowtotal
                       
                         // If there are neighbors in this partition, compute weights
                         val denom = 1 - priorClass.get(qlabel).get
-                        val indWeights = localRelief.mapActivePairs{ case((feat, cls), value) =>  
+                        val indWeights = localRelief.mapPairs{ case((feat, cls), value) =>  
                         if(classCounter(cls) == 0) {
                            0.0f
-                          } else if (cls != qlabel){
+                        } else if (cls != qlabel){
                            ((idxPriorClass.get(cls).get / denom) * value / classCounter(cls)).toFloat 
-                          } else {
+                        } else {
                            (-value / classCounter(cls)).toFloat
-                          }
                         }
+                       }
                        reliefWeights += breeze.linalg.sum(indWeights, Axis._1)
+                       extraLoop += System.currentTimeMillis() - nowtotal
                        totalInteractions.add(classCounter.sum)
+                       totalTime += System.currentTimeMillis() - nowtotal
+                       println("main: " + mainLoop)
+                       println("extra: " + extraLoop)
+                       println("main: " + totalTime)
+                       
                     } else {
                       omittedInstances.add(1L)
                     }
                   case None => /* Do nothing */
                 }
+                
               case None =>
                 System.err.println("Instance does not found in the table")
             }
@@ -525,7 +543,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val idxPriorClass = priorClass.zipWithIndex.map{case (k, v) => v -> k._2}
     val bTF = sc.broadcast(topFeatures)
     val isCont = !$(discreteData)
-    val lowerDistanceTh = .8f
+    val lowerDistanceTh = $(lowerDistanceThreshold)
     
     val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { 
       case(pindex, it) =>
@@ -542,8 +560,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         val jointVote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else 
                       (i1: Int, i2: Int) => pcounter(i1)
         val localRelief = new HashMap[Int, Array[Double]]
-            
-        bModelQuery.value.map{ case Row(qid: Long, qinput: SparseVector, qlabel: Double, _) =>
+        
+        bModelQuery.value.map{ row =>
+           val qid = row.getAs[Long](0); val qinput = row.getAs[SparseVector](1); val qlabel = row.getAs[Double](2)
            bNeighborsTable.value.get(qid) match { case Some(localMap) =>
                 val neighbors = localMap.get(pindex.toShort) match {
                   case Some(neighbors) =>
