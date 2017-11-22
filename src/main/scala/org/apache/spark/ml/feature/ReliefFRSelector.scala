@@ -422,10 +422,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                 
         while(it.hasNext){
           val (reference, neighbors) = it.next
-          var mainLoop = 0L
-          var extraLoop = 0L
-          var totalTime = 0L
-          val nowtotal = System.currentTimeMillis()
           val rnumber = r.nextFloat()
           val distanceThreshold = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
           val localRelief = BDM.zeros[Double](nFeat, label2Num.size); val classCounter = BDV.zeros[Long](label2Num.size)
@@ -467,7 +463,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
               
                 mainCollisioned.clear(); auxCollisioned.clear()
               }
-              mainLoop += System.currentTimeMillis() - nowtotal
             
               // If there are neighbors in this partition, compute weights
               val denom = 1 - priorClass.get(reference.label).get
@@ -480,14 +475,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                  (-value / classCounter(cls)).toFloat
               }
              }
-             extraLoop += System.currentTimeMillis() - nowtotal
              reliefWeights += breeze.linalg.sum(indWeights, Axis._1)
              totalInteractions.add(classCounter.sum)
-             totalTime += System.currentTimeMillis() - nowtotal
-             println("main: " + mainLoop)
-             println("extra: " + extraLoop)
-             println("main: " + totalTime)
-             
           } else {
             omittedInstances.add(1L)
           }
