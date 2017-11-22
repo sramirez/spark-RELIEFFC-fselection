@@ -821,13 +821,14 @@ final class ReliefFRSelectorModel private[ml] (
   def setRedundancyRemoval(value: Boolean): this.type = set(redundancyRemoval, value)
   
   private var subset: Int = getSelectedFeatures().length
-  def setReducedSubset(s: Int) {
+  def setReducedSubset(s: Int): this.type =  {
     if(s > 0 && s < getSelectedFeatures().length){
       subset = s
     } else {
       System.err.println("The number of features in the subset must" +
         " be lower than the total number and greater than 0")
     }
+    this
   }
   
   def getReducedSubsetParam(): Int = subset
@@ -880,11 +881,11 @@ object ReliefFRSelectorModel extends MLReadable[ReliefFRSelectorModel] {
 
   private[ReliefFRSelectorModel] class ReliefFRSelectorModelWriter(instance: ReliefFRSelectorModel) extends MLWriter {
 
-    private case class Data(reliefFeatures: Array[Int], reliefColFeatures: Array[Int])
+    private case class Data(reliefFeatures: Seq[Int], reliefColFeatures: Seq[Int])
 
     override protected def saveImpl(path: String): Unit = {
       DefaultParamsWriter.saveMetadata(instance, path, sc)
-      val data = Data(instance.reliefFeatures, instance.reliefColFeatures)
+      val data = Data(instance.reliefFeatures.toSeq, instance.reliefColFeatures.toSeq)
       val dataPath = new Path(path, "data").toString
       sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
     }
@@ -897,11 +898,9 @@ object ReliefFRSelectorModel extends MLReadable[ReliefFRSelectorModel] {
     override def load(path: String): ReliefFRSelectorModel = {
       val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
       val dataPath = new Path(path, "data").toString
-      val data = sparkSession.read.parquet(dataPath)
-      val Row(reliefFeatures: Array[Int], reliefColFeatures: Array[Int]) =
-        MLUtils.convertVectorColumnsToML(data, "reliefFeatures", "reliefColFeatures")
-          .select("originalMin", "originalMax")
-          .head()
+      val data = sparkSession.read.parquet(dataPath).select("reliefFeatures", "reliefColFeatures").head()
+      val reliefFeatures = data.getAs[Seq[Int]](0).toArray
+      val reliefColFeatures = data.getAs[Seq[Int]](1).toArray
       val model = new ReliefFRSelectorModel(metadata.uid, reliefFeatures, reliefColFeatures)
       DefaultParamsReader.getAndSetParams(model, metadata)
       model
