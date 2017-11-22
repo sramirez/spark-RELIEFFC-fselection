@@ -449,36 +449,12 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                       neighbors.map{ lidx =>
                         val Row(ninput: Vector, nlabel: Double) = localExamples(lidx)
                         val labelIndex = label2Num.get(nlabel.toFloat).get
-                        classCounter(labelIndex) += 1
+                        //classCounter(labelIndex) += 1
                               
                         qinput.foreachActive{ (index, value) =>
                            val fdistance = math.abs(value - ninput(index))
                            //// RELIEF Computations
-                           localRelief(index, labelIndex) += fdistance.toFloat
-                           //// Check if there exist a collision
-                           // The closer the distance, the more probable.
-                           if(fdistance <= distanceThreshold){
-                              val contribution = vote(fdistance)
-                              marginal(index) += contribution
-                              pcounter(index) = contribution
-                              val fit = mainCollisioned.iterator
-                              while(fit.hasNext){
-                                val i2 = fit.next
-                                joint(i2, index) += jointVote(index, i2)
-                              } 
-                              // Check if redundancy is relevant here. Depends on the feature' score in the previous stage.
-                              if(bTF.value.contains(index)){ 
-                                // Relevant, the feature is added to the main group and update auxiliar feat's.
-                                mainCollisioned += index
-                                val fit = auxCollisioned.iterator
-                                while(fit.hasNext){
-                                  val i2 = fit.next
-                                  joint(i2, index) += jointVote(index, i2)
-                                }
-                              } else { // Irrelevant, added to the secondary group
-                                auxCollisioned += index
-                              }
-                           }
+                           
                           }
                         
                           mainCollisioned.clear(); auxCollisioned.clear()
@@ -487,23 +463,12 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                       
                         // If there are neighbors in this partition, compute weights
                         val denom = 1 - priorClass.get(qlabel).get
-                        val indWeights = localRelief.mapPairs{ case((feat, cls), value) =>  
-                        if(classCounter(cls) == 0) {
-                           0.0f
-                        } else if (cls != qlabel){
-                           ((idxPriorClass.get(cls).get / denom) * value / classCounter(cls)).toFloat 
-                        } else {
-                           (-value / classCounter(cls)).toFloat
-                        }
-                       }
-                       reliefWeights += breeze.linalg.sum(indWeights, Axis._1)
+                        
+                       //reliefWeights += breeze.linalg.sum(indWeights, Axis._1)
                        extraLoop += System.currentTimeMillis() - nowtotal
-                       totalInteractions.add(classCounter.sum)
+                       //totalInteractions.add(classCounter.sum)
                        totalTime += System.currentTimeMillis() - nowtotal
-                       println("main: " + mainLoop)
-                       println("extra: " + extraLoop)
-                       println("main: " + totalTime)
-                       
+                      
                     } else {
                       omittedInstances.add(1L)
                     }
