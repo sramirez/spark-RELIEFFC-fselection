@@ -415,9 +415,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val bTF = sc.broadcast(topFeatures)
     val isCont = !$(discreteData); val lowerDistanceTh = $(lowerDistanceThreshold); val icol = $(inputCol); val lcol = $(labelCol)
     
-    val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { 
-      case(pindex, it) =>
-        val localExamples = it.toArray
+    val rawReliefWeights = modelDataset.rdd.glom.zipWithIndex.flatMap { case(localExamples, pindex) =>
         // last position is reserved to negative weights from central instances.
         val marginal = BDV.zeros[Double](nFeat)        
         val joint = BDM.zeros[Double](nFeat, nFeat)
@@ -545,9 +543,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val isCont = !$(discreteData)
     val lowerDistanceTh = $(lowerDistanceThreshold)
     
-    val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { 
-      case(pindex, it) =>
-        val localExamples = it.toArray
+    val rawReliefWeights = modelDataset.rdd.glom.zipWithIndex.flatMap { case(localExamples, pindex) =>
         // last position is reserved to negative weights from central instances.
         val marginal = new VectorBuilder[Double](nFeat)
         val joint = new CSCMatrix.Builder[Double](rows = nFeat, cols = nFeat)
