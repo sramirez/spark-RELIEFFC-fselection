@@ -246,7 +246,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val weights = Array.fill((1 / $(batchSize)).toInt)($(batchSize))
     val batches = modelDataset.sample(false, $(estimationRatio)).randomSplit(weights, $(seed))
     var featureWeights: BV[Float] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
-    var jointMatrix: BM[Double] = if (sparse) CSCMatrix.zeros(nFeat, nFeat) else BM.zeros(nFeat, nFeat) 
+    var jointMatrix: BM[Double] = CSCMatrix.zeros(nFeat, nFeat) 
     var marginalVector: BV[Double] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
     var topFeatures: Set[Int] = Set.empty
     var total = 0L // total number of comparisons at the collision level
@@ -257,9 +257,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     for(i <- 0 until batches.size) {
       val start = System.currentTimeMillis
       // Index query objects and compute the table that indicates where are located its neighbors
-      val idxModelQuery = batches(i).cache()
-      val query = if ($(numHashTables) > 0) idxModelQuery.select(col($(inputCol)), col($(labelCol)), col(hashOutputCol)) else
-            idxModelQuery.select(col($(inputCol)), col($(labelCol)))
+      val idxModelQuery = batches(i).withColumn("UniqueID", monotonically_increasing_id).cache()
+      val query = if ($(numHashTables) > 0) idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)), col(hashOutputCol)) else
+            idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)))
       val lquery = query.collect()
       println("size: " + lquery.length)
       logInfo("Estimated size for broadcasted query: " + SizeEstimator.estimate(lquery)) 
@@ -354,11 +354,11 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val neighbors = input.rdd.mapPartitions { 
       it => 
           // Initialize the map composed by the priority queue and the central element's ID
-          val query = bModelQuery.value // Fields: $(inputCol), $(labelCol), "hashOutputCol"
+          val query = bModelQuery.value // Fields: $("UniqueID") $(inputCol), $(labelCol), "hashOutputCol"
           val ordering = Ordering[Float].on[(Float, LabeledPoint)](_._1).reverse// BPQ needs reverse ordering   
-          val neighbors = query.map { r => 
-            LabeledPoint(r.getAs[Double](lcol), r.getAs[Vector](icol)) -> 
-                new BoundedPriorityQueue[(Float, LabeledPoint)](k)(ordering) 
+          val neighbors = query.map { r => r.getAs[Long]("UniqueID") -> 
+            (LabeledPoint(r.getAs[Double](lcol), r.getAs[Vector](icol)), 
+                new BoundedPriorityQueue[(Float, LabeledPoint)](k)(ordering))
           }   
       
           var i = 0
@@ -367,24 +367,24 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             if(lshOn) {
               val Row(inputNeig: Vector, labelNeig: Double, hashNeig: WrappedArray[Vector]) = it.next
               (0 until query.size).foreach { j => 
-                 val Row(inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
+                 val Row(_, inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
                  val hdist = BucketedRandomLSH.hashThresholdedDistance(hashQuery.array, hashNeig.array, qstep)
                  if(hdist < Double.PositiveInfinity) {
                    val distance = BucketedRandomLSH.keyDistance(inputQuery, inputNeig).toFloat
-                   neighbors(j)._2 += distance -> LabeledPoint(labelNeig, inputNeig)
+                   neighbors(j)._2._2 += distance -> LabeledPoint(labelNeig, inputNeig)
                  }    
                }
             } else {
               val Row(inputNeig: Vector, labelNeig: Double) = it.next
               (0 until query.size).foreach { j => 
                  val distance = BucketedRandomLSH.keyDistance(query(j).getAs[Vector](icol), inputNeig).toFloat
-                 neighbors(j)._2 += distance -> LabeledPoint(labelNeig, inputNeig)
+                 neighbors(j)._2._2 += distance -> LabeledPoint(labelNeig, inputNeig)
                }
             }
             i += 1              
           }            
           neighbors.toIterator
-      }.reduceByKey(_ ++= _).mapValues(_.map(_._2))
+      }.reduceByKey{ case ((lp1, n1),(_, n2)) => (lp1, n1 ++= n2)}.values.mapValues(_.map(_._2))
     neighbors
   }
   
@@ -493,9 +493,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   }
   
   private def computeReliefWeightsSparse (
-      modelDataset: Dataset[_],
-      bModelQuery: Broadcast[Array[Row]],
-      bNeighborsTable: Broadcast[Map[Long, Map[Short, Iterable[Int]]]],
+      neighbors: RDD[(LabeledPoint, Iterable[LabeledPoint])],
       topFeatures: Set[Int],
       priorClass: Map[Double, Float],
       nFeat: Int,
@@ -503,7 +501,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       ) = {
     
      // Initialize accumulators for RELIEF+Collision computation
-    val sc = modelDataset.sparkSession.sparkContext
+    val sc = neighbors.sparkContext
     val accMarginal = new VectorAccumulator(nFeat, sparse = true); sc.register(accMarginal, "marginal")
     val accJoint = new MatrixAccumulator(nFeat, nFeat, sparse = true); sc.register(accJoint, "joint")
     val totalInteractions = sc.longAccumulator("totalInteractions")
@@ -514,9 +512,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val isCont = !$(discreteData)
     val lowerDistanceTh = $(lowerDistanceThreshold)
     
-    val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { 
-      case(pindex, it) =>
-        val localExamples = it.toArray
+    val rawReliefWeights = neighbors.mapPartitions { case it =>
         // last position is reserved to negative weights from central instances.
         val marginal = new VectorBuilder[Double](nFeat)
         val joint = new CSCMatrix.Builder[Double](rows = nFeat, cols = nFeat)
@@ -530,93 +526,84 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                       (i1: Int, i2: Int) => pcounter(i1)
         val localRelief = new HashMap[Int, Array[Double]]
         
-        bModelQuery.value.map{ row =>
-           val qid = row.getAs[Long](0); val qinput = row.getAs[SparseVector](1); val qlabel = row.getAs[Double](2)
-           bNeighborsTable.value.get(qid) match { case Some(localMap) =>
-                val neighbors = localMap.get(pindex.toShort) match {
-                  case Some(neighbors) =>
-                    val boundary = neighbors.exists { i => 
-                      val Row(_, nlabel: Double) = localExamples(i)
-                      nlabel != qlabel 
-                    }
-                    if(boundary) { // Only boundary points allowed, omitted those homogeneous with the class
-                      
-                      val rnumber = r.nextFloat()
-                      val distanceThreshold = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
-                      val classCounter = BDV.zeros[Long](label2Num.size)
-                    
-                      neighbors.map{ lidx =>
-                        val Row(ninput: SparseVector, nlabel: Double) = localExamples(lidx)
-                        val labelIndex = label2Num.get(nlabel.toFloat).get
-                        classCounter(labelIndex) += 1
-    
-                        val v1Indices = qinput.indices; val nnzv1 = v1Indices.length; var kv1 = 0
-                        val v2Indices = ninput.indices; val nnzv2 = v2Indices.length; var kv2 = 0
-                        
-                        while (kv1 < nnzv1 || kv2 < nnzv2) {
-                          var score = 0.0; var index = kv1
-                
-                          if (kv2 >= nnzv2 || (kv1 < nnzv1 && v1Indices(kv1) < v2Indices(kv2))) {
-                            score = qinput.values(kv1); kv1 += 1; index = kv1
-                          } else if (kv1 >= nnzv1 || (kv2 < nnzv2 && v2Indices(kv2) < v1Indices(kv1))) {
-                            score = ninput.values(kv2); kv2 += 1; index = kv2
-                          } else {
-                            score = qinput.values(kv1) - ninput.values(kv2); kv1 += 1; kv2 += 1; index = kv1
-                          }
-                          val fdistance = math.abs(score)
-                          //// RELIEF Computations
-                          val updateV = localRelief.getOrElse(index, Array.fill(label2Num.size)(0.0d))
-                          updateV(labelIndex) += fdistance 
-                          localRelief += index -> updateV
-                          //// Check if there exist a collision
-                          // The closer the distance, the more probable.
-                           if(fdistance <= distanceThreshold){
-                              val contribution = vote(fdistance)
-                              marginal.add(index, contribution)
-                              pcounter(index) = contribution
-                              val fit = mainCollisioned.iterator
-                              while(fit.hasNext){
-                                val i2 = fit.next
-                                joint.add(i2, index, jointVote(index, i2))
-                              } 
-                              // Check if redundancy is relevant here. Depends on the feature' score in the previous stage.
-                              if(bTF.value.contains(index)){ // Relevant, the feature is added to the main group and update auxiliar feat's.
-                                mainCollisioned += index
-                                val fit = auxCollisioned.iterator
-                                while(fit.hasNext){
-                                  val i2 = fit.next
-                                  joint.add(i2, index, jointVote(index, i2))
-                                }
-                              } else { // Irrelevant, added to the secondary group
-                                auxCollisioned += index
-                              }
-                           }
-                        }
-                        mainCollisioned.clear(); auxCollisioned.clear(); pcounter.clear()
+        while(it.hasNext){
+          val (reference, neighbors) = it.next
+          val qinput = reference.features.toSparse
+          val boundary = neighbors.exists { lp => lp.label != reference.label }
+          
+          if(boundary) { // Only boundary points allowed, omitted those homogeneous with the class
+            
+            val rnumber = r.nextFloat()
+            val distanceThreshold = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
+            val classCounter = BDV.zeros[Long](label2Num.size)
+          
+            neighbors.foreach { lpneigh =>
+              val labelIndex = label2Num.get(lpneigh.label.toFloat).get
+              classCounter(labelIndex) += 1
+              val ninput = lpneigh.features.toSparse
+
+              val v1Indices = qinput.indices; val nnzv1 = v1Indices.length; var kv1 = 0
+              val v2Indices = ninput.indices; val nnzv2 = v2Indices.length; var kv2 = 0
+              
+              while (kv1 < nnzv1 || kv2 < nnzv2) {
+                var score = 0.0; var index = kv1
+      
+                if (kv2 >= nnzv2 || (kv1 < nnzv1 && v1Indices(kv1) < v2Indices(kv2))) {
+                  score = qinput.values(kv1); kv1 += 1; index = kv1
+                } else if (kv1 >= nnzv1 || (kv2 < nnzv2 && v2Indices(kv2) < v1Indices(kv1))) {
+                  score = ninput.values(kv2); kv2 += 1; index = kv2
+                } else {
+                  score = qinput.values(kv1) - ninput.values(kv2); kv1 += 1; kv2 += 1; index = kv1
+                }
+                val fdistance = math.abs(score)
+                //// RELIEF Computations
+                val updateV = localRelief.getOrElse(index, Array.fill(label2Num.size)(0.0d))
+                updateV(labelIndex) += fdistance 
+                localRelief += index -> updateV
+                //// Check if there exist a collision
+                // The closer the distance, the more probable.
+                 if(fdistance <= distanceThreshold){
+                    val contribution = vote(fdistance)
+                    marginal.add(index, contribution)
+                    pcounter(index) = contribution
+                    val fit = mainCollisioned.iterator
+                    while(fit.hasNext){
+                      val i2 = fit.next
+                      joint.add(i2, index, jointVote(index, i2))
+                    } 
+                    // Check if redundancy is relevant here. Depends on the feature' score in the previous stage.
+                    if(bTF.value.contains(index)){ // Relevant, the feature is added to the main group and update auxiliar feat's.
+                      mainCollisioned += index
+                      val fit = auxCollisioned.iterator
+                      while(fit.hasNext){
+                        val i2 = fit.next
+                        joint.add(i2, index, jointVote(index, i2))
                       }
-                       val denom = 1 - priorClass.get(qlabel).get
-                       localRelief.foreach { case (feat, v) =>
-                         val score = v.zipWithIndex.map{ case(value, cls) =>
-                           if(classCounter(cls) == 0) {
-                             0.0f
-                           } else if (cls != qlabel){
-                             ((idxPriorClass.get(cls).get / denom) * value / classCounter(cls)).toFloat 
-                           } else {
-                             (-value / classCounter(cls)).toFloat
-                           }
-                         }.sum
-                         reliefWeights.add(feat, score)
-                       }
-                       totalInteractions.add(classCounter.sum)
-                       localRelief.clear()
-                    } else {
-                      omittedInstances.add(1L)
-                    }  
-                  case None => /* Do nothing */
-                }                  
-              case None =>
-                System.err.println("Instance does not found in the table")
+                    } else { // Irrelevant, added to the secondary group
+                      auxCollisioned += index
+                    }
+                 }
+              }
+              mainCollisioned.clear(); auxCollisioned.clear(); pcounter.clear()
             }
+             val denom = 1 - priorClass.get(reference.label).get
+             localRelief.foreach { case (feat, v) =>
+               val score = v.zipWithIndex.map{ case(value, cls) =>
+                 if(classCounter(cls) == 0) {
+                   0.0f
+                 } else if (cls != reference.label){
+                   ((idxPriorClass.get(cls).get / denom) * value / classCounter(cls)).toFloat 
+                 } else {
+                   (-value / classCounter(cls)).toFloat
+                 }
+               }.sum
+               reliefWeights.add(feat, score)
+             }
+             totalInteractions.add(classCounter.sum)
+             localRelief.clear()
+          } else {
+            omittedInstances.add(1L)
+          }
       }
       // update accumulated matrices  
       accMarginal.add(marginal.toSparseVector)
@@ -695,9 +682,11 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         case bsm: CSCMatrix[Double] => 
           val begin = bsm.colPtrs(selected.head.feat)
           val end = bsm.colPtrs(selected.head.feat + 1)
-          bsm.rowIndices.slice(begin, end).foreach{ k =>
-            if(pool(k).get.valid)
-              pool(k).get.update(bsm.data(k).toFloat)
+          (begin until end).foreach{ k =>
+            val feat = bsm.rowIndices(k)
+            if(pool(feat).get.valid){
+              pool(feat).get.update(bsm.data(k).toFloat)
+            }              
           }
         case bdm: BDM[Double] =>
           (0 until pool.size).foreach{ k =>  

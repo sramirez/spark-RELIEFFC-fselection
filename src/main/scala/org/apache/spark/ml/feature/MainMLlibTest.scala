@@ -735,11 +735,12 @@ object MainMLlibTest {
     val runtime = (System.currentTimeMillis - now) / 1000
     println("RELIEF-F model trained in " + runtime + "s")
     
-    inputLabel = "features"
-    val rawTestDF = TestHelper.readData(sqlContext, testFile, firstHeader, format)
-    val testDF = preProcess(rawTestDF).select(clsLabel, inputLabel).cache()
-    
     if(predict) {
+      
+      inputLabel = "features"
+      val rawTestDF = TestHelper.readData(sqlContext, testFile, firstHeader, format)
+      val testDF = preProcess(rawTestDF).select(clsLabel, inputLabel).cache()
+      
       // Print best features according to the RELIEF-F measure
       nselect.reverse.foreach{ nfeat => 
         val reliefCollModel = model.setRedundancyRemoval(true).setReducedSubset(nfeat)
@@ -788,9 +789,6 @@ object MainMLlibTest {
         println("Baseline train accuracy (LR) = " + accLR)  
       
       }
-      
-      
-    
     }
     println("\n*** Modeling runtime for FS: " + runtime + "s")    
 
