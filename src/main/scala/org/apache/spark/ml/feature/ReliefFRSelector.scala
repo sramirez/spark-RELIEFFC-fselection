@@ -399,7 +399,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
      // Initialize accumulators for RELIEF+Collision computation
     val sc = neighbors.sparkContext
     val accMarginal = new VectorAccumulator(nFeat, sparse = false); sc.register(accMarginal, "marginal")
-    val accJoint = new MatrixAccumulator(nFeat, nFeat, sparse = false);  sc.register(accJoint, "joint")
+    val accJoint = new MatrixAccumulator(nFeat, nFeat, sparse = true);  sc.register(accJoint, "joint")
     val totalInteractions = sc.longAccumulator("totalInteractions")
     val omittedInstances = sc.longAccumulator("omittedInstances")
     val label2Num = priorClass.zipWithIndex.map{case (k, v) => k._1 -> v.toShort}
@@ -410,7 +410,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val rawReliefWeights = neighbors.mapPartitions { it =>
         // last position is reserved to negative weights from central instances.
         val marginal = BDV.zeros[Double](nFeat)        
-        val joint = BDM.zeros[Double](nFeat, nFeat)
+        val joint = new CSCMatrix.Builder[Double](rows = nFeat, cols = nFeat)
+        // Builder is better than hash sparse vector, we need to reduce communication overhead
         val reliefWeights = BDV.zeros[Float](nFeat)         
         val r = new scala.util.Random($(seed))
         // Data are assumed to be scaled to have 0 mean, and 1 std
@@ -444,7 +445,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                     val fit = mainCollisioned.iterator
                     while(fit.hasNext){
                       val i2 = fit.next
-                      joint(i2, index) += jointVote(index, i2)
+                      joint.add(i2, index, jointVote(index, i2))
                     } 
                     // Check if redundancy is relevant here. Depends on the feature' score in the previous stage.
                     if(bTF.value.contains(index)){ 
@@ -453,7 +454,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                       val fit = auxCollisioned.iterator
                       while(fit.hasNext){
                         val i2 = fit.next
-                        joint(i2, index) += jointVote(index, i2)
+                        joint.add(i2, index, jointVote(index, i2))
                       }
                     } else { // Irrelevant, added to the secondary group
                       auxCollisioned += index
@@ -484,7 +485,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         
       // update accumulated matrices 
       accMarginal.add(marginal)
-      accJoint.add(joint)
+      accJoint.add(joint.result)
       reliefWeights.activeIterator
     }.reduceByKey(_ + _)
      
