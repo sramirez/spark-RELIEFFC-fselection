@@ -735,6 +735,13 @@ object MainMLlibTest {
     val runtime = (System.currentTimeMillis - now) / 1000
     println("RELIEF-F model trained in " + runtime + "s")
     
+    val reliefCollModel = model.setRedundancyRemoval(true).setReducedSubset(nselect.max)
+    val reliefModel = model.setRedundancyRemoval(false).setReducedSubset(nselect.max)
+    val outRC = reliefCollModel.getSelectedFeatures().mkString("\n")
+    val outR = reliefModel.getSelectedFeatures().mkString("\n")
+    println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
+    println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
+    
     if(predict) {
       
       inputLabel = "features"
