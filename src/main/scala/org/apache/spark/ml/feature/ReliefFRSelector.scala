@@ -51,6 +51,7 @@ import breeze.generic.MappingUFunc
 import breeze.linalg.support._
 import scala.collection.immutable.HashSet
 import org.apache.spark.util.SizeEstimator
+import scala.collection.mutable.ArrayBuffer
 
 /**
  * Params for [[ReliefFRSelector]] and [[ReliefFRSelectorModel]].
@@ -526,7 +527,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
          // Initialize accumulators for RELIEF+Collision computation
       val sc = modelDataset.sparkSession.sparkContext
       val accMarginal = new VectorAccumulator(nFeat, sparse = true); sc.register(accMarginal, "marginal")
-      val accJoint = new MatrixAccumulator(nFeat, nFeat, sparse = true); sc.register(accJoint, "joint")
+      val cooJoint = new COOAccumulator(); sc.register(cooJoint, "coojoint")
       val totalInteractions = sc.longAccumulator("totalInteractions")
       val label2Num = priorClass.zipWithIndex.map{case (k, v) => k._1 -> v}
       val idxPriorClass = priorClass.zipWithIndex.map{case (k, v) => v -> k._2}
@@ -539,19 +540,19 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           // last position is reserved to negative weights from central instances.
           val localExamples = it.toArray
           val marginal = new VectorBuilder[Double](nFeat)
-          val joint = new CSCMatrix.Builder[Double](rows = nFeat, cols = nFeat)
+          val joint = new ArrayBuffer[(Int, Int, Double)]
           val reliefWeights = new HashMap[Int, BDV[Float]]
           val classCounter = BDV.zeros[Double](label2Num.size * 2)        
           val r = new scala.util.Random(lseed)
           // Data are assumed to be scaled to have 0 mean, and 1 std
           val vote = if(isCont) (d: Double) => 1 - math.min(6.0, d) / 6.0 else (d: Double) => Double.MinPositiveValue
           val mainCollisioned = Queue[Int](); val auxCollisioned = Queue[Int]() // annotate similar features
-          val pcounter = Array.fill(nFeat)(0.0d) // isolate the strength of collision by feature
-          val jointVote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else 
-                        (i1: Int, _: Int) => pcounter(i1)
-                        
+          //val pcounter = Array.fill(nFeat)(0.0d) // isolate the strength of collision by feature
+          //val jointVote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else (i1: Int, _: Int) => pcounter(i1)
+          val jointVote = 1.0              
           bModelQuery.value.map{ row =>
-              val qid = row.getAs[Long]("UniqueID"); val qinput = row.getAs[SparseVector](icol); val qlabel = row.getAs[Double](lcol)
+              val qid = row.getAs[Long]("UniqueID"); val qinput = row.getAs[SparseVector](icol) 
+              val qlabel = row.getAs[Double](lcol)
               bNeighborsTable.value.get(qid) match { 
                 case Some(localMap) =>
                   localMap.get(pindex) match {
@@ -586,12 +587,12 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                           // The closer the distance, the more probable.
                            if(fdistance <= distanceThreshold){
                               val contribution = vote(fdistance)
-                              //marginal.add(index, contribution)
-                              pcounter(index) = contribution
+                              marginal.add(index, contribution)
+                              //pcounter(index) = contribution
                               val fit = mainCollisioned.iterator
                               while(fit.hasNext){
                                 val i2 = fit.next
-                                joint.add(i2, index, jointVote(index, i2))
+                                joint += ((i2, index, jointVote))
                               } 
                               // Check if redundancy is relevant here. Depends on the feature' score in the previous stage.
                               if(bTF.value.contains(index)){ // Relevant, the feature is added to the main group and update auxiliar feat's.
@@ -599,7 +600,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                                 val fit = auxCollisioned.iterator
                                 while(fit.hasNext){
                                   val i2 = fit.next
-                                  joint.add(i2, index, jointVote(index, i2))
+                                  joint += ((i2, index, jointVote))
                                 }
                               } else { // Irrelevant, added to the secondary group
                                 auxCollisioned += index
@@ -615,17 +616,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             }
         }
         // update accumulated matrices  
-        val asd = marginal.toSparseVector
-        
-        println("asd size: " + asd.activeSize)
-        accMarginal.add(asd)
-        
-        val asd2 = joint.result
-        println("asd2 size: " + asd2.activeSize)
-        accJoint.add(asd2)
+        accMarginal.add(marginal.toSparseVector)        
+        cooJoint.add(joint)
         totalInteractions.add(classCounter.sum.toLong)
         bClassCounter.add(classCounter)
-        println("relief size: " + reliefWeights.size)
         reliefWeights.iterator
         
       }.reduceByKey(_ + _)
@@ -645,7 +639,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
          }
          sum
       }
-     
+      
+      val accJoint = new MatrixAccumulator(nFeat, nFeat, cooJoint.value); sc.register(accJoint, "joint")
       (weights, accJoint, accMarginal, totalInteractions)
   }
   
@@ -815,7 +810,7 @@ final class ReliefFRSelectorModel private[ml] (
   
   private var subset: Int = getSelectedFeatures().length
   def setReducedSubset(s: Int): this.type =  {
-    if(s > 0 && s < getSelectedFeatures().length){
+    if(s > 0 && s <= getSelectedFeatures().length){
       subset = s
     } else {
       System.err.println("The number of features in the subset must" +
