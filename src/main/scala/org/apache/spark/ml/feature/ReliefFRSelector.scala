@@ -272,7 +272,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           sc.broadcast(neighbors.collectAsMap().toMap)
       
       val (rawWeights: RDD[(Int, Float)], partialJoint, partialMarginal, partialCount) =  
-            computeReliefWeights(
+          if (!sparse) computeReliefWeights(
+              idxModelQuery.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
+          topFeatures, priorClass, nFeat, nElems)
+          else  computeReliefWeightsSparse(
               idxModelQuery.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
           topFeatures, priorClass, nFeat, nElems)
       
@@ -436,7 +439,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             val qid = row.getAs[Long]("UniqueID"); val qinput = row.getAs[Vector](icol); val qlabel = row.getAs[Double](lcol)
             bNeighborsTable.value.get(qid) match { 
               case Some(localMap) =>
-                localMap.get(pindex.toShort) match {
+                localMap.get(pindex) match {
                   case Some(neighbors) =>
                     val rnumber = r.nextFloat()
                     val distanceThreshold = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
@@ -492,7 +495,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     }.reduceByKey(_ + _)
      
     val cc = bClassCounter.value
-    println("cc: " +  cc.toArray.mkString(","))
     val weights = rawReliefWeights.mapValues { case reliefByClass =>
        val nClasses = idxPriorClass.size
        var sum = 0.0f
@@ -549,15 +551,15 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                         (i1: Int, _: Int) => pcounter(i1)
                         
           bModelQuery.value.map{ row =>
-              val qid = row.getAs[Long]("UniqueID"); val qinput = row.getAs[Vector](icol).toSparse; val qlabel = row.getAs[Double](lcol)
+              val qid = row.getAs[Long]("UniqueID"); val qinput = row.getAs[SparseVector](icol); val qlabel = row.getAs[Double](lcol)
               bNeighborsTable.value.get(qid) match { 
                 case Some(localMap) =>
-                  localMap.get(pindex.toShort) match {
+                  localMap.get(pindex) match {
                     case Some(neighbors) =>
                       val rnumber = r.nextFloat()
                       val distanceThreshold = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
                       neighbors.map{ lidx =>
-                        val Row(rninput: Vector, nlabel: Double) = localExamples(lidx); val ninput = rninput.toSparse
+                        val Row(ninput: SparseVector, nlabel: Double) = localExamples(lidx)
                         val labelIndex = label2Num.get(nlabel.toFloat).get
                         val mod = if(nlabel == qlabel) label2Num.size * MOD.sameClass else label2Num.size * MOD.otherClass
                         classCounter(labelIndex + mod) += 1
@@ -584,7 +586,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                           // The closer the distance, the more probable.
                            if(fdistance <= distanceThreshold){
                               val contribution = vote(fdistance)
-                              marginal.add(index, contribution)
+                              //marginal.add(index, contribution)
                               pcounter(index) = contribution
                               val fit = mainCollisioned.iterator
                               while(fit.hasNext){
@@ -613,11 +615,19 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             }
         }
         // update accumulated matrices  
-        accMarginal.add(marginal.toSparseVector)
-        accJoint.add(joint.result)
+        val asd = marginal.toSparseVector
+        
+        println("asd size: " + asd.activeSize)
+        accMarginal.add(asd)
+        
+        val asd2 = joint.result
+        println("asd2 size: " + asd2.activeSize)
+        accJoint.add(asd2)
         totalInteractions.add(classCounter.sum.toLong)
         bClassCounter.add(classCounter)
+        println("relief size: " + reliefWeights.size)
         reliefWeights.iterator
+        
       }.reduceByKey(_ + _)
       
       val cc = bClassCounter.value
@@ -636,7 +646,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
          sum
       }
      
-      (rawReliefWeights, accJoint, accMarginal, totalInteractions)
+      (weights, accJoint, accMarginal, totalInteractions)
   }
   
   private def computeRedudancy(rawJoint: BM[Double], rawMarginal: BV[Double], 

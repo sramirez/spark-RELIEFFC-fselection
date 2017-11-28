@@ -90,7 +90,7 @@ object MainMLlibTest {
   
   def main(args: Array[String]) {
     
-    val initStartTime = System.nanoTime()
+  val initStartTime = System.nanoTime()
     
   val conf = new SparkConf().setAppName("CollisionFS Test")//.setMaster("local[*]").set("spark.driver.memory", "16g").set("spark.executor.memory", "16g")
     val sc = new SparkContext(conf)
@@ -721,7 +721,9 @@ object MainMLlibTest {
       .setDiscreteData(!continuous)
     
     val now = System.currentTimeMillis
-    val modelPath = "RELIEF-model-" + numHashTables + bucketWidth +signatureSize+k+estimationRatio+batchSize+lowerFeatThreshold
+    val dataname = pathFile.split("/").last
+    val modelPath = "RELIEF-model-" + dataname + "-" + numHashTables + bucketWidth +
+        signatureSize+k+estimationRatio+batchSize+lowerFeatThreshold
     var model: ReliefFRSelectorModel = null
     try {
         model = ReliefFRSelectorModel.load(modelPath)
