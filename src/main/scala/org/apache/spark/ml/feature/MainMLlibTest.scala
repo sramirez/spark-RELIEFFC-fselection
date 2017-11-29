@@ -737,7 +737,7 @@ object MainMLlibTest {
       }
     }
     val runtime = (System.currentTimeMillis - now) / 1000
-    println("RELIEF-F model trained in " + runtime + "s")
+    println("RELIEF-F model training time (seconds) = " + runtime)
     
     val reliefCollModel = model.setRedundancyRemoval(true).setReducedSubset(nselect.max)
     val reliefModel = model.setRedundancyRemoval(false).setReducedSubset(nselect.max)
@@ -802,7 +802,7 @@ object MainMLlibTest {
       
       }
     }
-    println("\n*** Modeling runtime for FS: " + runtime + "s")    
+    println("\n*** Modeling runtime for FS (seconds) = " + runtime)    
 
   }
   
