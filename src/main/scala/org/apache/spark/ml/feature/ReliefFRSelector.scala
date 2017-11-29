@@ -326,7 +326,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     (0 until batches.size).foreach(i => results(i).unpersist())
     
     // normalized redundancy
-    val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat)
+    val redundancyMatrix = computeRedudancy(jointMatrix, marginalVector, total, nFeat, sparse)
     val rddFinalWeights = finalWeights.rdd.map{ case Row(k: Int, _, normScore: Float) => (k, normScore)}.cache()
     val (reliefCol, relief) = selectFeatures(rddFinalWeights, redundancyMatrix, nFeat)
     val outRC = reliefCol.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
@@ -545,11 +545,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           val classCounter = BDV.zeros[Double](label2Num.size * 2)        
           val r = new scala.util.Random(lseed)
           // Data are assumed to be scaled to have 0 mean, and 1 std
-          val vote = if(isCont) (d: Double) => 1 - math.min(6.0, d) / 6.0 else (d: Double) => Double.MinPositiveValue
+          val vote = Double.MinPositiveValue
           val mainCollisioned = Queue[Int](); val auxCollisioned = Queue[Int]() // annotate similar features
-          //val pcounter = Array.fill(nFeat)(0.0d) // isolate the strength of collision by feature
-          //val jointVote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else (i1: Int, _: Int) => pcounter(i1)
-          val jointVote = 1.0              
+          
           bModelQuery.value.map{ row =>
               val qid = row.getAs[Long]("UniqueID"); val qinput = row.getAs[SparseVector](icol) 
               val qlabel = row.getAs[Double](lcol)
@@ -586,13 +584,12 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                           //// Check if there exist a collision
                           // The closer the distance, the more probable.
                            if(fdistance <= distanceThreshold){
-                              val contribution = vote(fdistance)
-                              marginal.add(index, contribution)
+                              marginal.add(index, vote)
                               //pcounter(index) = contribution
                               val fit = mainCollisioned.iterator
                               while(fit.hasNext){
                                 val i2 = fit.next
-                                joint += ((i2, index, jointVote))
+                                joint += ((i2, index, vote))
                               } 
                               // Check if redundancy is relevant here. Depends on the feature' score in the previous stage.
                               if(bTF.value.contains(index)){ // Relevant, the feature is added to the main group and update auxiliar feat's.
@@ -600,7 +597,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                                 val fit = auxCollisioned.iterator
                                 while(fit.hasNext){
                                   val i2 = fit.next
-                                  joint += ((i2, index, jointVote))
+                                  joint += ((i2, index, vote))
                                 }
                               } else { // Irrelevant, added to the secondary group
                                 auxCollisioned += index
@@ -645,9 +642,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   }
   
   private def computeRedudancy(rawJoint: BM[Double], rawMarginal: BV[Double], 
-      total: Long, nFeat: Int) = {
+      total: Long, nFeat: Int, sparse: Boolean) = {
     // Now compute redundancy based on collisions and normalize it
-    val factor = if($(discreteData)) Double.MinPositiveValue else 1.0
+    val factor = if($(discreteData) || sparse) Double.MinPositiveValue else 1.0
     val marginal = rawMarginal.mapActiveValues(_ /  (total * factor))
     
     var maxRed = Double.NegativeInfinity; var minRed = Double.PositiveInfinity

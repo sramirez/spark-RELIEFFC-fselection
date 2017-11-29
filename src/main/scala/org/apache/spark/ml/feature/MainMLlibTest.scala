@@ -42,6 +42,7 @@ import org.apache.spark.mllib.regression.{LabeledPoint => OldLP}
 import org.apache.spark.mllib.linalg.{Vectors => OldVectors}
 import org.apache.spark.sql.types.StructField
 import org.apache.spark.ml.linalg.VectorUDT
+import org.apache.spark.ml.util.ModDiscretizerModel
 
 
 
@@ -588,17 +589,17 @@ object MainMLlibTest {
         .setApproximate(true)
         
       val model = discretizer.fit(processedDF)
-      val rddModel = new org.apache.spark.mllib.feature.DiscretizerModel(model.splits)
-      val inputRDD = processedDF.select(inputLabel, clsLabel).rdd.map{case Row(v: Vector, l: Double) => OldVectors.fromML(v) -> l}
-      val discRDD = rddModel.transformRDD(inputRDD.map(_._1))
-          .zip(inputRDD.map(_._2))
-          .map{case (v, l) => Row(l, v.asML)}
-      
+      val rddModel = new ModDiscretizerModel(model.splits)
+      val inputRDD = processedDF.select(clsLabel, inputLabel).rdd.map{
+        case Row(l: Double, v: Vector) => OldLP(l, OldVectors.fromML(v)) }
+      val discRDD = rddModel.transformRDD(inputRDD)
+      if(savePreprocess) 
+        MLUtils.saveAsLibSVMFile(discRDD, pathFile + ".disc")
       inputLabel = "disc-" + inputLabel
       val schema = new StructType()
-            .add(StructField(clsLabel, DoubleType, true))
             .add(StructField(inputLabel, new VectorUDT(), true))
-      val discDF = sqlContext.createDataFrame(discRDD, schema)
+            .add(StructField(clsLabel, DoubleType, true))
+      val discDF = sqlContext.createDataFrame(discRDD.map{ lp => Row(lp.features.asML, lp.label)}, schema).cache()      
       processedDF = discDF      
       continuous = false
     } else if(normalize) {
@@ -617,7 +618,7 @@ object MainMLlibTest {
         processedDF.select(clsLabel, inputLabel).rdd
           .map{case Row(label: Double, features: Vector) => features.toArray.mkString(",") + "," + label}
           .saveAsTextFile(pathFile + ".disc")
-      } else if (format == "libsvm") {
+      } else if (format == "libsvm" && !discretize) {
         val output = processedDF.select(clsLabel, inputLabel).rdd
               .map{case Row(label: Double, features: Vector) => OldLP(label, OldVectors.fromML(features))}
         MLUtils.saveAsLibSVMFile(output, pathFile + ".disc")
@@ -760,27 +761,28 @@ object MainMLlibTest {
         println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
         println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
         
-        var mrmrAcc = 0.0f; var mrmrAccDT = 0.0f; var mrmrAccLR = 0.0f; var selectedMRMR = new String();
+        var mrmrAcc = 0.0; var mrmrAccDT = 0.0; var mrmrAccLR = 0.0; var selectedMRMR = new String();
         if(mrmr){    
           val now = System.currentTimeMillis
           val mRMRmodel = fitMRMR(df)
           val runtime = (System.currentTimeMillis - now) / 1000
           println("mRMR model trained in " + runtime + "s")
           println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
-          mrmrAccDT = kCVPerformance(mRMRmodel.transform(df), "dt")
-          mrmrAccLR = kCVPerformance(mRMRmodel.transform(df), "lr")
+          val reducedMRMR = mRMRmodel.transform(testDF).cache()
+          mrmrAccDT = holdOutPerformance(df, reducedMRMR, "dt")
+          mrmrAccLR = holdOutPerformance(df, reducedMRMR, "lr")
           selectedMRMR = mRMRmodel.selectedFeatures.map(_ + 1).mkString(",")
+          reducedMRMR.unpersist()
         }
           
-        var relCAcc = 0.0f; var relAcc = 0.0f; var acc = 0.0f;
-        val reducedRC = reliefCollModel.transform(df).cache()
+        val reducedRC = reliefCollModel.transform(testDF).cache()
         val tReducedRC = reliefCollModel.transform(testDF).cache()
         val relCAccDT = holdOutPerformance(reducedRC, tReducedRC, "dt") 
         val relCAccLR = holdOutPerformance(reducedRC, tReducedRC, "lr") 
         reducedRC.unpersist(); tReducedRC.unpersist()
         
         
-        val reducedR = reliefModel.transform(df).cache()
+        val reducedR = reliefModel.transform(testDF).cache()
         val tReducedR = reliefModel.transform(testDF).cache()
         val relAccDT = holdOutPerformance(reducedR, tReducedR, "dt") 
         val relAccLR = holdOutPerformance(reducedR, tReducedR, "lr") 
