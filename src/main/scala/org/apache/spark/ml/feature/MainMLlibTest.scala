@@ -643,6 +643,10 @@ object MainMLlibTest {
   }
   
   def fitMRMR(df: Dataset[_]) = {
+    
+    val dataname = pathFile.split("/").last.split("-").head
+    val modelPath = "MRMR-model-" + dataname + "-" + numHashTables + "-" + bucketWidth + "-" +
+        signatureSize + "-" + k + "-" + estimationRatio + "-" + batchSize + "-" + lowerFeatThreshold
     val selector = new InfoThSelector()
         .setSelectCriterion("mrmr")
         .setNPartitions(nPartitions)
@@ -650,8 +654,17 @@ object MainMLlibTest {
         .setFeaturesCol(inputLabel) // this must be a feature vector
         .setLabelCol(clsLabel)
         .setOutputCol("selectedFeatures")
-        
-    selector.fit(df)
+    var model: InfoThSelectorModel = null
+    try {
+        model = InfoThSelectorModel.load(modelPath)
+    } catch {
+      case t: Throwable => {
+        t.printStackTrace() // TODO: handle error
+        model = selector.fit(df)
+        model.save(modelPath)
+      }
+    }
+    model
   }
   
   def testLSHPerformance(df: Dataset[_], nelems: Long) {
@@ -723,9 +736,9 @@ object MainMLlibTest {
       .setDiscreteData(!continuous)
     
     val now = System.currentTimeMillis
-    val dataname = pathFile.split("/").last
-    val modelPath = "RELIEF-model-" + dataname + "-" + numHashTables + bucketWidth +
-        signatureSize+k+estimationRatio+batchSize+lowerFeatThreshold
+    val dataname = pathFile.split("/").last.split("-").head
+    val modelPath = "RELIEF-model-" + dataname + "-" + numHashTables + "-" + bucketWidth + "-" +
+        signatureSize + "-" + k + "-" + estimationRatio + "-" + batchSize + "-" + lowerFeatThreshold
     var model: ReliefFRSelectorModel = null
     try {
         model = ReliefFRSelectorModel.load(modelPath)
@@ -766,7 +779,7 @@ object MainMLlibTest {
           val now = System.currentTimeMillis
           val mRMRmodel = fitMRMR(df)
           val runtime = (System.currentTimeMillis - now) / 1000
-          println("mRMR model trained in " + runtime + "s")
+          println("mRMR model training time (in s) = " + runtime)
           println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
           val reducedMRMR = mRMRmodel.transform(testDF).cache()
           mrmrAccDT = holdOutPerformance(df, reducedMRMR, "dt")
@@ -791,14 +804,14 @@ object MainMLlibTest {
         val accDT = holdOutPerformance(df, testDF, "dt") 
         val accLR = holdOutPerformance(df, testDF, "lr")        
     
-        println("Train accuracy for mRMR (Decision Tree) = " + mrmrAccDT)
-        println("Train accuracy for ReliefColl (Decision Tree) = " + relCAccDT)
-        println("Train accuracy for Relief (Decision Tree) = " + relAccDT)
-        println("Baseline train accuracy (Decision Tree) = " + accDT)
-        println("Train accuracy for mRMR (LR) = " + mrmrAccLR)
-        println("Train accuracy for ReliefColl (LR) = " + relCAccLR)
-        println("Train accuracy for Relief (LR) = " + relAccLR)
-        println("Baseline train accuracy (LR) = " + accLR)  
+        println("Test accuracy for mRMR-" + nfeat + "-DT = " + mrmrAccDT)
+        println("Test accuracy for Reliefc-" + nfeat + "DT = " + relCAccDT)
+        println("Test accuracy for Relief-" + nfeat + "DT = " + relAccDT)
+        println("Test accuracy for baseline-0-DT = " + accDT)
+        println("Test accuracy for mRMR-" + nfeat + "-LR = " + mrmrAccLR)
+        println("Test accuracy for Reliefc-" + nfeat + "LR = " + relCAccLR)
+        println("Test accuracy for Relief-" + nfeat + "LR = " + relAccLR)
+        println("Test accuracy for baseline-0-LR = " + accLR)  
       
       }
     }
