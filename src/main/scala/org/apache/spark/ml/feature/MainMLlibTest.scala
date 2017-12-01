@@ -724,8 +724,8 @@ object MainMLlibTest {
     
     val now = System.currentTimeMillis
     val dataname = pathFile.split("/").last
-    val modelPath = "RELIEF-model-" + dataname + "-" + numHashTables + bucketWidth +
-        signatureSize+k+estimationRatio+batchSize+lowerFeatThreshold
+    val modelPath = "RELIEF-model-" + dataname + "-" + numHashTables + "-" + bucketWidth + "-" +
+        signatureSize + "-" + k + "-" + estimationRatio+ "-" + batchSize + "-" + lowerFeatThreshold
     var model: ReliefFRSelectorModel = null
     try {
         model = ReliefFRSelectorModel.load(modelPath)
