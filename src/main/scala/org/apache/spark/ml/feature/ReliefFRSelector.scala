@@ -54,6 +54,7 @@ import org.apache.spark.util.SizeEstimator
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.immutable.TreeMap
 import org.apache.spark.ml.linalg.Vectors
+import org.apache.spark.ml.knn.KNN
 
 /**
  * Params for [[ReliefFRSelector]] and [[ReliefFRSelectorModel]].
@@ -251,6 +252,13 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     var total = 0L // total number of comparisons at the collision level
     val results: Array[RDD[(Int, (Float, Vector))]] = Array.fill(batches.size)(sc.emptyRDD)
     logInfo("Number of batches to be computed in RELIEF: " + results.size)
+    val knn = new KNN()
+        .setFeaturesCol($(inputCol))
+        .setK($(numNeighbors))
+    val knnModel = knn.fit(dataset)
+        
+      
+        //.groupBy(_._1).mapValues(_.map(_._2)).map(identity)
         
     for(i <- 0 until batches.size) {
       val start = System.currentTimeMillis
@@ -263,8 +271,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       logInfo("Estimated size for broadcasted query: " + SizeEstimator.estimate(lquery)) 
       val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(lquery)
           
-      val neighbors: RDD[(Long, Map[Int, Iterable[Int]])] = approxNNByPartition(idxModelQuery, 
-          bFullQuery, $(numNeighbors) * priorClass.size, hashOutputCol)
+      //val neighbors: RDD[(Long, Map[Int, Iterable[Int]])] = approxNNByPartition(idxModelQuery, 
+      //    bFullQuery, $(numNeighbors) * priorClass.size, hashOutputCol)
+      val neighbors = knnModel.nearestNeighbor(query)
+            .mapValues(_.groupBy(_._1).mapValues(_.map(_._2).toIterable).map(identity))
       
       val bNeighborsTable: Broadcast[Map[Long, Map[Int, Iterable[Int]]]] = 
           sc.broadcast(neighbors.collectAsMap().toMap)
@@ -389,7 +399,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   }
   
   private def computeReliefWeights (
-      modelDataset: Dataset[_],
+      modelDataset: RDD[Tree],
       bModelQuery: Broadcast[Array[Row]],
       bNeighborsTable: Broadcast[Map[Long, Map[Int, Iterable[Int]]]],
       topFeatures: Set[Int],
