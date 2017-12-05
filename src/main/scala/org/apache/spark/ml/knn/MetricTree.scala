@@ -19,7 +19,7 @@ private[ml] abstract class Tree extends Serializable {
   val rightChild: Tree
   val size: Int
   val leafCount: Int
-  val pivot: VectorWithNorm
+  val pivot: LPWithNorm
   val radius: Double
 
   def iterator: Iterator[RowWithVector]
@@ -30,8 +30,8 @@ private[ml] abstract class Tree extends Serializable {
    * @param k number of nearest neighbor
    * @return a list of neighbor that is nearest to the query vector
    */
-  def query(v: Vector, k: Int = 1): Iterable[(RowWithVector, Double)] = query(new VectorWithNorm(v), k)
-  def query(v: VectorWithNorm, k: Int): Iterable[(RowWithVector, Double)] = query(new KNNCandidates(v, k)).toIterable
+  def query(v: Vector, k: Int = 1): Iterable[(RowWithVector, Double)] = query(new LPWithNorm(v), k)
+  def query(v: LPWithNorm, k: Int): Iterable[(RowWithVector, Double)] = query(new KNNCandidates(v, k)).toIterable
 
   /**
    * Refine k-NN candidates using data in this [[Tree]]
@@ -45,8 +45,8 @@ private[ml] abstract class Tree extends Serializable {
    */
   private[knn] def distance(candidates: KNNCandidates): Double = distance(candidates.queryVector)
 
-  private[knn] def distance(v: VectorWithNorm): Double =
-    if(pivot.vector.size > 0) pivot.fastDistance(v) else 0.0
+  private[knn] def distance(v: LPWithNorm): Double =
+    if(pivot.vector.features.size > 0) pivot.fastDistance(v) else 0.0
 }
 
 private[knn]
@@ -55,17 +55,17 @@ case object Empty extends Tree {
   override val rightChild = this
   override val size = 0
   override val leafCount = 0
-  override val pivot = new VectorWithNorm(Vectors.dense(Array.empty[Double]))
+  override val pivot = new LPWithNorm(Vectors.dense(Array.empty[Double]))
   override val radius = 0.0
 
   override def iterator: Iterator[RowWithVector] = Iterator.empty
   override def query(candidates: KNNCandidates): KNNCandidates = candidates
 }
 
-private[knn] class Leaf (val d: IndexedSeq[RowWithVector],
-                    val pivot: VectorWithNorm,
+private[knn] class Leaf (val data: IndexedSeq[RowWithVector],
+                    val pivot: LPWithNorm,
                     val radius: Double) extends Tree {
-  val data = d.zipWithIndex.map{ case(v,i) => new RowWithVector(i, v) }
+  //val data = d.zipWithIndex.map{ case(v,i) => v.index = i; v }
   override val leftChild = Empty
   override val rightChild = Empty
   override val size = data.size
@@ -89,12 +89,12 @@ private[knn] class Leaf (val d: IndexedSeq[RowWithVector],
 private[knn]
 object Leaf {
   def apply(data: IndexedSeq[RowWithVector]): Leaf = {
-    val vectors = data.map(_.vector.vector.asBreeze)
+    val vectors = data.map(_.vector.vector.features.asBreeze)
     val (minV, maxV) = vectors.foldLeft((vectors.head, vectors.head)) {
       case ((accMin, accMax), bv) =>
         (min(accMin, bv), max(accMax, bv))
     }
-    val pivot = new VectorWithNorm((minV + maxV) / 2.0)
+    val pivot = new LPWithNorm((minV + maxV) / 2.0)
     val radius = math.sqrt(squaredDistance(minV, maxV)) / 2.0
     new Leaf(data, pivot, radius)
   }
@@ -117,10 +117,10 @@ object Leaf {
  */
 private[knn]
 case class MetricTree(leftChild: Tree,
-                         leftPivot: VectorWithNorm,
+                         leftPivot: LPWithNorm,
                          rightChild: Tree,
-                         rightPivot: VectorWithNorm,
-                         pivot: VectorWithNorm,
+                         rightPivot: LPWithNorm,
+                         pivot: LPWithNorm,
                          radius: Double
                           ) extends Tree {
   override val size = leftChild.size + rightChild.size
@@ -176,7 +176,7 @@ object MetricTree {
         new Leaf(data, randomPivot, 0.0)
       } else {
         val rightPivot = data.maxBy(v => leftPivot.fastSquaredDistance(v.vector)).vector
-        val pivot = new VectorWithNorm(Vectors.fromBreeze((leftPivot.vector.asBreeze + rightPivot.vector.asBreeze) / 2.0))
+        val pivot = new LPWithNorm(Vectors.fromBreeze((leftPivot.vector.features.asBreeze + rightPivot.vector.features.asBreeze) / 2.0))
         val radius = math.sqrt(data.map(v => pivot.fastSquaredDistance(v.vector)).max)
         val (leftPartition, rightPartition) = data.partition{
           v => leftPivot.fastSquaredDistance(v.vector) < rightPivot.fastSquaredDistance(v.vector)
@@ -206,10 +206,10 @@ object MetricTree {
  */
 private[knn]
 case class SpillTree(leftChild: Tree,
-                                      leftPivot: VectorWithNorm,
+                                      leftPivot: LPWithNorm,
                                       rightChild: Tree,
-                                      rightPivot: VectorWithNorm,
-                                      pivot: VectorWithNorm,
+                                      rightPivot: LPWithNorm,
+                                      pivot: LPWithNorm,
                                       radius: Double,
                                       tau: Double,
                                       bufferSize: Int
@@ -243,7 +243,7 @@ case class SpillTree(leftChild: Tree,
     candidates
   }
 
-  private[this] val childFilter: (VectorWithNorm, VectorWithNorm) => RowWithVector => Boolean =
+  private[this] val childFilter: (LPWithNorm, LPWithNorm) => RowWithVector => Boolean =
     (p1, p2) => p => p.vector.fastDistance(p1) - p.vector.fastDistance(p2) > tau
 }
 
@@ -272,7 +272,7 @@ object SpillTree {
         new Leaf(data, randomPivot, 0.0)
       } else {
         val rightPivot = data.maxBy(v => leftPivot.fastSquaredDistance(v.vector)).vector
-        val pivot = new VectorWithNorm(Vectors.fromBreeze((leftPivot.vector.asBreeze + rightPivot.vector.asBreeze) / 2.0))
+        val pivot = new LPWithNorm(Vectors.fromBreeze((leftPivot.vector.features.asBreeze + rightPivot.vector.features.asBreeze) / 2.0))
         val radius = math.sqrt(data.map(v => pivot.fastSquaredDistance(v.vector)).max)
         val dataWithDistance = data.map(v =>
           (v, leftPivot.fastDistance(v.vector), rightPivot.fastDistance(v.vector))
@@ -325,7 +325,7 @@ object HybridTree {
         new Leaf(data, randomPivot, 0.0)
       } else {
         val rightPivot = data.maxBy(v => leftPivot.fastSquaredDistance(v.vector)).vector
-        val pivot = new VectorWithNorm(Vectors.fromBreeze((leftPivot.vector.asBreeze + rightPivot.vector.asBreeze) / 2.0))
+        val pivot = new LPWithNorm(Vectors.fromBreeze((leftPivot.vector.features.asBreeze + rightPivot.vector.features.asBreeze) / 2.0))
         val radius = math.sqrt(data.map(v => pivot.fastSquaredDistance(v.vector)).max)
         lazy val dataWithDistance = data.map(v =>
           (v, leftPivot.fastDistance(v.vector), rightPivot.fastDistance(v.vector))
@@ -373,7 +373,7 @@ object HybridTree {
  * @param k number of neighbors to return
  */
 private[knn]
-class KNNCandidates(val queryVector: VectorWithNorm, val k: Int) extends Serializable {
+class KNNCandidates(val queryVector: LPWithNorm, val k: Int) extends Serializable {
   private[knn] val candidates = mutable.PriorityQueue.empty[(RowWithVector, Double)] {
     Ordering.by(_._2)
   }

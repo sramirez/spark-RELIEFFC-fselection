@@ -207,44 +207,24 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     // Get Hash Value of the key 
     val hashOutputCol = "hashRELIEF_" + System.currentTimeMillis()
-    val modelDataset: DataFrame = if($(numHashTables) > 0){
-      val now = System.currentTimeMillis
-      val brp = new BucketedRandomLSH()
-        .setInputCol($(inputCol))
-        .setOutputCol(hashOutputCol)
-        .setSparseSpeedup($(sparseSpeedup))
-        .setNumHashTables($(numHashTables))
-        .setBucketLength($(bucketLength))
-        .setSignatureSize($(signatureSize))
-        .setSeed($(seed))
-      val LSHmodel = brp.fit(dataset)
-      val hashRuntime = (System.currentTimeMillis - now) / 1000
-      logInfo("Hash model trained in " + hashRuntime + "s")
-      
-      // Generate hash code for the complete dataset
-      if (!dataset.columns.contains(hashOutputCol)) {
-          LSHmodel.transform(dataset).cache()
-        } else {
-          dataset.toDF()
-        }  
-    } else {
-      dataset.toDF()
-    }
+    val knnModel = knn.fit(dataset)
+    val modelDataset: RDD[(Int, KNN.RowWithVector)] = knnModel.subTrees.mapPartitionsWithIndex{case (index, it) => it.flatMap(tree => tree.iterator.map(v => index -> v))}
     
     // Get some basic information about the dataset
     val sc = dataset.sparkSession.sparkContext
     val spark = dataset.sparkSession.sqlContext
     val nElems = modelDataset.count() // needed to persist the training set
-    val first = modelDataset.head().getAs[Vector]($(inputCol))
-    val sparse = first.isInstanceOf[SparseVector]
-    val nFeat = first.size
+    val first = modelDataset.first()._2.vector.vector
+    val sparse = first.features.isInstanceOf[SparseVector]
+    val nFeat = first.features.size
     val lowerFeat = math.max($(numTopFeatures), math.round($(lowerFeatureThreshold).toFloat * $(numTopFeatures))) // 0 is the min, 0.5 the median
-    val priorClass = modelDataset.select($(labelCol)).rdd.map{ case Row(label: Double) => label }
+    val priorClass = modelDataset.map{ _._2.vector.vector.label }
         .countByValue()
         .mapValues(v => (v.toDouble / nElems).toFloat)
         .map(identity).toMap
             
     val weights = Array.fill((1 / $(batchSize)).toInt)($(batchSize))
+    
     val batches = modelDataset.sample(false, $(estimationRatio)).randomSplit(weights, $(seed))
     var featureWeights: BV[Float] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
     var marginalVector: BV[Double] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
@@ -255,7 +235,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val knn = new KNN()
         .setFeaturesCol($(inputCol))
         .setK($(numNeighbors))
-    val knnModel = knn.fit(dataset)
         
       
         //.groupBy(_._1).mapValues(_.map(_._2)).map(identity)

@@ -3,7 +3,7 @@ package org.apache.spark.ml.knn
 import breeze.linalg.{DenseVector, Vector => BV}
 import breeze.stats._
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.ml.knn.KNN.{KNNPartitioner, RowWithVector, VectorWithNorm}
+import org.apache.spark.ml.knn.KNN.{KNNPartitioner, RowWithVector, LPWithNorm}
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
@@ -21,9 +21,10 @@ import scala.annotation.tailrec
 import scala.collection.mutable.ArrayBuffer
 import scala.util.hashing.byteswap64
 import org.apache.spark.mllib.knn.KNNUtils
+import org.apache.spark.ml.feature.LabeledPoint
 
 // features column => vector, input columns => auxiliary columns to return by KNN model
-private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInputCols {
+private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInputCols with HasOutputCol {
   /**
     * Param for the column name for returned neighbors.
     * Default: "neighbors"
@@ -86,13 +87,13 @@ private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInpu
   /** @group getParam */
   def getBufferSize: Double = $(bufferSize)
 
-  private[ml] def transform(data: RDD[Vector], topTree: Broadcast[Tree], subTrees: RDD[Tree]): RDD[(Long, Array[(Int, Int)])] = {
+  
+  private[ml] def transform(data: RDD[LPWithNorm], topTree: Broadcast[Tree], subTrees: RDD[Tree]): RDD[((Int, Int), Array[(Int, Int)])] = {
     val searchData = data.zipWithIndex()
       .flatMap {
         case (vector, index) =>
-          val vectorWithNorm = new VectorWithNorm(vector)
-          val idx = KNN.searchIndices(vectorWithNorm, topTree.value, $(bufferSize))
-            .map(i => (i, (vectorWithNorm, index)))
+          val idx = KNN.searchIndices(vector, topTree.value, $(bufferSize))
+            .map(i => (i, (vector, index)))
 
           assert(idx.nonEmpty, s"indices must be non-empty: $vector ($index)")
           idx
@@ -104,10 +105,10 @@ private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInpu
         val tree = trees.next()
         assert(!trees.hasNext)
         childData.flatMap {
-          case (treeId, (point, i)) =>
+          case (partID, (point, i)) =>
             tree.query(point, $(k)).collect {
               case (neighbor, distance) if distance <= $(maxDistance) =>
-                (i, (treeId, neighbor.index, distance))
+                ((partID, point.index), (partID, neighbor.vector.index, distance.toFloat))
             }
         }
     }
@@ -118,7 +119,10 @@ private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInpu
   }
 
   private[ml] def transform(dataset: Dataset[_], topTree: Broadcast[Tree], subTrees: RDD[Tree]): RDD[(Long, Array[(Int, Int)])] = {
-    transform(dataset.select($(featuresCol)).rdd.map(_.getAs[Vector](0)), topTree, subTrees)
+    val input = dataset.selectExpr($(featuresCol), $(outputCol))
+      .rdd
+      .map(row => LabeledPoint(row.getAs[Double](1), row.getAs[Vector](0)))
+    transform(input, topTree, subTrees)
   }
 
 }
@@ -248,6 +252,10 @@ class KNNModel private[ml](
   def nearestNeighbor(dataset: Dataset[_]): RDD[(Long, Array[(Int, Int)])] = {
     transform(dataset, topTree, subTrees)
   }
+  
+  def relief(dataset: Dataset[_]): RDD[(Long, Array[(Int, Int)])] = {
+    transform(dataset, topTree, subTrees)
+  }
 
   //TODO: All these can benefit from DataSet API
   override def transform(dataset: Dataset[_]): DataFrame = {
@@ -350,6 +358,10 @@ class KNN(override val uid: String) extends Estimator[KNNModel] with KNNParams {
 
   /** @group setParam */
   def setAuxCols(value: Array[String]): this.type = set(inputCols, value)
+  
+  /** @group setParam */
+  def setOutputCol(value: String): this.type = set(outputCol, value)
+  
 
   /** @group setParam */
   def setTopTreeSize(value: Int): this.type = set(topTreeSize, value)
@@ -372,9 +384,9 @@ class KNN(override val uid: String) extends Estimator[KNNModel] with KNNParams {
   override def fit(dataset: Dataset[_]): KNNModel = {
     val rand = new XORShiftRandom($(seed))
     //prepare data for model estimation
-    val data = dataset.selectExpr($(featuresCol), $(inputCols).mkString("struct(", ",", ")"))
+    val data = dataset.selectExpr($(featuresCol), $(inputCols).mkString("struct(", ",", ")"), $(outputCol))
       .rdd
-      .map(row => new RowWithVector(-1, row.getAs[Vector](0), row.getStruct(1)))
+      .map(row => new RowWithVector(-1, row.getAs[Vector](0), row.getAs[Double](3), row.getStruct(1)))
     //sample data to build top-level tree
     val sampled = data.sample(withReplacement = false, $(topTreeSize).toDouble / dataset.count(), rand.nextLong()).collect()
     val topTree = MetricTree.build(sampled, $(topTreeLeafSize), rand.nextLong())
@@ -394,8 +406,9 @@ class KNN(override val uid: String) extends Estimator[KNNModel] with KNNParams {
     val trees = repartitioned.mapPartitionsWithIndex {
       (partitionId, itr) =>
         val rand = new XORShiftRandom(byteswap64($(seed) ^ partitionId))
+        val indexed = itr.zipWithIndex.map{ case (v, i) => v.index = i; v}.toIndexedSeq
         val childTree =
-          HybridTree.build(itr.toIndexedSeq, $(subTreeLeafSize), tau, $(balanceThreshold), rand.nextLong())
+          HybridTree.build(indexed, $(subTreeLeafSize), tau, $(balanceThreshold), rand.nextLong())
 
         Iterator(childTree)
     }.persist(StorageLevel.MEMORY_AND_DISK)
@@ -421,28 +434,31 @@ object KNN {
   /**
     * VectorWithNorm can use more efficient algorithm to calculate distance
     */
-  case class VectorWithNorm(vector: Vector, norm: Double) {
-    def this(vector: Vector) = this(vector, Vectors.norm(vector, 2))
+  case class LPWithNorm(var index: Int, vector: LabeledPoint, norm: Double) {
+    def this(lp: LabeledPoint) = this(-1, lp, Vectors.norm(lp.features, 2))
 
-    def this(vector: BV[Double]) = this(Vectors.fromBreeze(vector))
+    def this(vector: BV[Double]) = this(LabeledPoint(-1, Vectors.fromBreeze(vector)))
+    def this(vector: Vector) = this(LabeledPoint(-1, vector))
 
-    def fastSquaredDistance(v: VectorWithNorm): Double = {
-      KNNUtils.fastSquaredDistance(vector, norm, v.vector, v.norm)
+    def fastSquaredDistance(v: LPWithNorm): Double = {
+      KNNUtils.fastSquaredDistance(vector.features, norm, v.vector.features, v.norm)
     }
 
-    def fastDistance(v: VectorWithNorm): Double = math.sqrt(fastSquaredDistance(v))
+    def fastDistance(v: LPWithNorm): Double = math.sqrt(fastSquaredDistance(v))
   }
 
   /**
     * VectorWithNorm plus auxiliary row information
     */
-  case class RowWithVector(index: Int, vector: VectorWithNorm, row: Row) {
-    def this(index: Int, vector: Vector, row: Row) = this(index, new VectorWithNorm(vector), row)
-    def this(index: Int, vector: RowWithVector) = this(index, vector.vector, vector.row)
+  case class RowWithVector(vector: LPWithNorm, row: Row) {
+    def this(index: Int, lp: LabeledPoint, row: Row) = this(new LPWithNorm(lp), row)
+    def this(index: Int, vector: Vector, label: Double, row: Row) = this(new LPWithNorm(LabeledPoint(label, vector)), row)
+    
+    def this(index: Int, vector: RowWithVector) = this(vector.vector, vector.row)
     
   }
   
-  case class RowWithVectorWithLocation(idxTree: Int, partIdx: Long, vector: VectorWithNorm, row: Row)
+  case class RowWithVectorWithLocation(idxTree: Int, partIdx: Long, vector: LPWithNorm, row: Row)
   
   /**
     * Estimate a suitable buffer size based on dataset
@@ -544,7 +560,7 @@ object KNN {
   }
 
   //TODO: Might want to make this tail recursive
-  private[ml] def searchIndices(v: VectorWithNorm, tree: Tree, tau: Double, acc: Int = 0): Seq[Int] = {
+  private[ml] def searchIndices(v: LPWithNorm, tree: Tree, tau: Double, acc: Int = 0): Seq[Int] = {
     tree match {
       case node: MetricTree =>
         val leftDistance = node.leftPivot.fastDistance(v)
