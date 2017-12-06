@@ -55,6 +55,7 @@ import scala.collection.mutable.ArrayBuffer
 import scala.collection.immutable.TreeMap
 import org.apache.spark.ml.linalg.Vectors
 import org.apache.spark.ml.knn.KNN
+import org.apache.spark.ml.knn.Tree
 
 /**
  * Params for [[ReliefFRSelector]] and [[ReliefFRSelectorModel]].
@@ -207,18 +208,22 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     // Get Hash Value of the key 
     val hashOutputCol = "hashRELIEF_" + System.currentTimeMillis()
+    val knn = new KNN()
+        .setFeaturesCol($(inputCol))
+        .setOutputCol($(labelCol))
+        .setK($(numNeighbors))
     val knnModel = knn.fit(dataset)
-    val modelDataset: RDD[(Int, KNN.RowWithVector)] = knnModel.subTrees.mapPartitionsWithIndex{case (index, it) => it.flatMap(tree => tree.iterator.map(v => index -> v))}
+    val modelDataset: RDD[KNN.LPWithNorm] = knnModel.subTrees.mapPartitions{it => it.next.iterator.map(_.vector)}
     
     // Get some basic information about the dataset
     val sc = dataset.sparkSession.sparkContext
     val spark = dataset.sparkSession.sqlContext
     val nElems = modelDataset.count() // needed to persist the training set
-    val first = modelDataset.first()._2.vector.vector
+    val first = modelDataset.first().vector
     val sparse = first.features.isInstanceOf[SparseVector]
     val nFeat = first.features.size
     val lowerFeat = math.max($(numTopFeatures), math.round($(lowerFeatureThreshold).toFloat * $(numTopFeatures))) // 0 is the min, 0.5 the median
-    val priorClass = modelDataset.map{ _._2.vector.vector.label }
+    val priorClass = modelDataset.map{ _.vector.label }
         .countByValue()
         .mapValues(v => (v.toDouble / nElems).toFloat)
         .map(identity).toMap
@@ -232,39 +237,19 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     var total = 0L // total number of comparisons at the collision level
     val results: Array[RDD[(Int, (Float, Vector))]] = Array.fill(batches.size)(sc.emptyRDD)
     logInfo("Number of batches to be computed in RELIEF: " + results.size)
-    val knn = new KNN()
-        .setFeaturesCol($(inputCol))
-        .setK($(numNeighbors))
-        
-      
-        //.groupBy(_._1).mapValues(_.map(_._2)).map(identity)
-        
+
+     
     for(i <- 0 until batches.size) {
       val start = System.currentTimeMillis
       // Index query objects and compute the table that indicates where are located its neighbors
-      val idxModelQuery = batches(i).withColumn("UniqueID", monotonically_increasing_id).cache()
-      val query = if ($(numHashTables) > 0) idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)), col(hashOutputCol)) else
-            idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)))
-      val lquery = query.collect()
-      println("size: " + lquery.length)
-      logInfo("Estimated size for broadcasted query: " + SizeEstimator.estimate(lquery)) 
-      val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(lquery)
-          
-      //val neighbors: RDD[(Long, Map[Int, Iterable[Int]])] = approxNNByPartition(idxModelQuery, 
-      //    bFullQuery, $(numNeighbors) * priorClass.size, hashOutputCol)
-      val neighbors = knnModel.nearestNeighbor(query)
-            .mapValues(_.groupBy(_._1).mapValues(_.map(_._2).toIterable).map(identity))
-      
-      val bNeighborsTable: Broadcast[Map[Long, Map[Int, Iterable[Int]]]] = 
-          sc.broadcast(neighbors.collectAsMap().toMap)
+      val (neighbors, references) = knnModel.transformRELIEF(batches(i), knnModel.topTree, knnModel.subTrees)
       
       val (rawWeights: RDD[(Int, (Float, Vector))], partialMarginal, partialCount) =  
-          if (!sparse) computeReliefWeights(
+          computeReliefWeights(knnModel.subTrees, neighbors, references, 
+              topFeatures, priorClass, nFeat, nElems)
+          /*else  computeReliefWeightsSparse(
               idxModelQuery.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
-          topFeatures, priorClass, nFeat, nElems)
-          else  computeReliefWeightsSparse(
-              idxModelQuery.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
-          topFeatures, priorClass, nFeat, nElems)
+          topFeatures, priorClass, nFeat, nElems)*/
       
       // Normalize previous results and return the best features
       results(i) = rawWeights.cache() 
@@ -285,7 +270,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       //println("# omitted instances in this step: " + skipped)
         
       // Free some resources
-      bNeighborsTable.destroy(); bFullQuery.destroy(); idxModelQuery.unpersist();
+      references.unpersist()
       val btime = (System.currentTimeMillis - start) / 1000
       logInfo("Batch #" + i + " computed in " + btime + "s")
     }
@@ -322,65 +307,15 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       partialWeights.mapValues{ x => (x - minRelief) / (maxRelief - minRelief)}
   }  
   
-  // TODO: Fix the MultiProbe NN Search in SPARK-18454
-  private def approxNNByPartition(
-      modelDataset: Dataset[_],
-      bModelQuery: Broadcast[Array[Row]],
-      k: Int,
-      hashCol: String): RDD[(Long, Map[Int, Iterable[Int]])] = {
-    
-    case class Localization(part: Int, index: Int)
-    val sc = modelDataset.sparkSession.sparkContext
-    val qstep = $(queryStep)
-    val lshOn = $(numHashTables) > 0
-    val input = if(lshOn) modelDataset.select($(inputCol), hashCol) else modelDataset.select($(inputCol))
-    val icol = $(inputCol)
-    
-    val neighbors = input.rdd.mapPartitionsWithIndex { 
-      case (pindex, it) => 
-          // Initialize the map composed by the priority queue and the central element's ID
-          val query = bModelQuery.value // Fields: "UniqueID", $(inputCol), $(labelCol), "hashOutputCol"
-          val ordering = Ordering[Float].on[(Float, Localization)](_._1).reverse// BPQ needs reverse ordering   
-          val neighbors = query.map { r => r.getAs[Long]("UniqueID") -> new BoundedPriorityQueue[(Float, Localization)](k)(ordering) }   
-      
-          var i = 0
-          // First iterate over the local elements, and then over the sampled set (also called query set).
-          while(it.hasNext) {
-            if(lshOn) {
-              val Row(inputNeig: Vector, hashNeig: WrappedArray[Vector]) = it.next
-              (0 until query.size).foreach { j => 
-                 val Row(_, inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
-                 val hdist = BucketedRandomLSH.hashThresholdedDistance(hashQuery.array, hashNeig.array, qstep)
-                 if(hdist < Double.PositiveInfinity) {
-                   val distance = BucketedRandomLSH.keyDistance(inputQuery, inputNeig).toFloat
-                   neighbors(j)._2 += distance -> Localization(pindex.toShort, i)
-                 }    
-               }
-            } else {
-              val inputNeig = it.next.getAs[Vector](icol)
-              (0 until query.size).foreach { j => 
-                 val distance = BucketedRandomLSH.keyDistance(query(j).getAs[Vector](icol), inputNeig).toFloat
-                 neighbors(j)._2 += distance -> Localization(pindex.toShort, i)    
-               }
-            }
-            i += 1              
-          }            
-          neighbors.toIterator
-      }.reduceByKey(_ ++= _).mapValues(
-          _.map(l => Localization.unapply(l._2).get).groupBy(_._1).mapValues(_.map(_._2)).map(identity)) 
-      // map(identity) needed to fix bug: https://issues.scala-lang.org/browse/SI-7005
-    neighbors
-  }
-  
   object MOD {
     val sameClass = 0
     val otherClass = 1
-  }
+  } 
   
   private def computeReliefWeights (
-      modelDataset: RDD[Tree],
-      bModelQuery: Broadcast[Array[Row]],
-      bNeighborsTable: Broadcast[Map[Long, Map[Int, Iterable[Int]]]],
+      subTrees: RDD[Tree],
+      neighbors: RDD[(Int, (Long, Array[Int]))],
+      searchData: RDD[(Int, (KNN.LPWithNorm, Long))],
       topFeatures: Set[Int],
       priorClass: Map[Double, Float],
       nFeat: Int,
@@ -388,7 +323,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       ) = {
     
      // Initialize accumulators for RELIEF+Collision computation
-    val sc = modelDataset.sparkSession.sparkContext
+    val sc = subTrees.sparkContext
     val accMarginal = new VectorAccumulator(nFeat, sparse = false); sc.register(accMarginal, "marginal")
     val accJoint = new MatrixAccumulator(nFeat, nFeat, sparse = false); sc.register(accJoint, "joint")
     val totalInteractions = sc.longAccumulator("totalInteractions")
@@ -398,9 +333,11 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val bTF = sc.broadcast(topFeatures)
     val isCont = !$(discreteData); val lowerDistanceTh = $(lowerDistanceThreshold); val icol = $(inputCol); val lcol = $(labelCol)
         
-    val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { case(pindex, it) =>
+    val rawReliefWeights = subTrees.zipPartitions(neighbors, searchData){ (trees, neigs, refs) =>
+        val referenceTable = refs.map{case (_, (lpwn, id)) => id -> lpwn.vector}.toMap
+        val treeTable = trees.next().iterator.map(e => e.vector.index -> e.vector.vector).toMap
+        
         // last position is reserved to negative weights from central instances.
-        val localExamples = it.toArray
         val marginal = BDV.zeros[Double](nFeat)
         val reliefWeights = BDV.fill[(BDV[Float], BDV[Double])](nFeat)(
             (BDV.zeros[Float](label2Num.size * 2), BDV.zeros[Double](nFeat)))
@@ -413,22 +350,20 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         val jointVote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else 
                       (i1: Int, _: Int) => pcounter(i1)
                       
-        bModelQuery.value.map{ row =>
-            val qid = row.getAs[Long]("UniqueID"); val qinput = row.getAs[Vector](icol); val qlabel = row.getAs[Double](lcol)
-            bNeighborsTable.value.get(qid) match { 
-              case Some(localMap) =>
-                localMap.get(pindex) match {
-                  case Some(neighbors) =>
-                    val rnumber = r.nextFloat()
-                    val distanceThreshold = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
-                    neighbors.map{ lidx =>
-                      val Row(ninput: Vector, nlabel: Double) = localExamples(lidx)
-                      val labelIndex = label2Num.get(nlabel.toFloat).get
-                      val mod = if(nlabel == qlabel) label2Num.size * MOD.sameClass else label2Num.size * MOD.otherClass
+        neigs.map{ case(_, (rid, vtid)) =>
+            referenceTable.get(rid) match { 
+              case Some(ref) =>
+                vtid.foreach{ tid =>
+                  treeTable.get(tid) match {
+                    case Some(neig) =>
+                      val rnumber = r.nextFloat()
+                      val distanceThreshold = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
+                      val labelIndex = label2Num.get(neig.label.toFloat).get
+                      val mod = if(neig.label == ref.label) label2Num.size * MOD.sameClass else label2Num.size * MOD.otherClass
                       classCounter(labelIndex + mod) += 1
                             
-                      qinput.foreachActive{ (index, value) =>
-                         val fdistance = math.abs(value - ninput(index))
+                      ref.features.foreachActive{ (index, value) =>
+                         val fdistance = math.abs(value - neig.features(index))
                          //// RELIEF Computations
                          reliefWeights(index)._1(labelIndex + mod) += fdistance.toFloat
                          //// Check if there exist a collision
@@ -458,8 +393,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                          }
                         }                        
                         mainCollisioned.clear(); auxCollisioned.clear()
-                    }
-                  case None => /* Do nothing */
+                    case None => /* Do nothing */
+                  }  
                 }                
               case None =>
                 System.err.println("Instance does not found in the table")
@@ -488,10 +423,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
          }
          sum -> Vectors.fromBreeze(joint)
       }
-      
          
     (weights, accMarginal, totalInteractions)
   }
+  
   
   private def computeReliefWeightsSparse (
       modelDataset: Dataset[_],

@@ -65,7 +65,6 @@ case object Empty extends Tree {
 private[knn] class Leaf (val data: IndexedSeq[RowWithVector],
                     val pivot: LPWithNorm,
                     val radius: Double) extends Tree {
-  //val data = d.zipWithIndex.map{ case(v,i) => v.index = i; v }
   override val leftChild = Empty
   override val rightChild = Empty
   override val size = data.size

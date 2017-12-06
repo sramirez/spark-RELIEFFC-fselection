@@ -22,6 +22,9 @@ import scala.collection.mutable.ArrayBuffer
 import scala.util.hashing.byteswap64
 import org.apache.spark.mllib.knn.KNNUtils
 import org.apache.spark.ml.feature.LabeledPoint
+import org.apache.spark.ml.feature.VectorAccumulator
+import org.apache.spark.ml.feature.MatrixAccumulator
+import scala.collection.mutable.Queue
 
 // features column => vector, input columns => auxiliary columns to return by KNN model
 private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInputCols with HasOutputCol {
@@ -88,16 +91,18 @@ private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInpu
   def getBufferSize: Double = $(bufferSize)
 
   
-  private[ml] def transform(data: RDD[LPWithNorm], topTree: Broadcast[Tree], subTrees: RDD[Tree]): RDD[((Int, Int), Array[(Int, Int)])] = {
+  private[ml] def transform(data: RDD[Vector], topTree: Broadcast[Tree], subTrees: RDD[Tree]): RDD[(Long, Array[(Row,Double)])] = {
     val searchData = data.zipWithIndex()
       .flatMap {
         case (vector, index) =>
-          val idx = KNN.searchIndices(vector, topTree.value, $(bufferSize))
-            .map(i => (i, (vector, index)))
+          val vectorWithNorm = new LPWithNorm(vector.asBreeze)
+          val idx = KNN.searchIndices(vectorWithNorm, topTree.value, $(bufferSize))
+            .map(i => (i, (vectorWithNorm, index)))
 
           assert(idx.nonEmpty, s"indices must be non-empty: $vector ($index)")
           idx
-      }.partitionBy(new HashPartitioner(subTrees.partitions.length))
+      }
+      .partitionBy(new HashPartitioner(subTrees.partitions.length))
 
     // for each partition, search points within corresponding child tree
     val results = searchData.zipPartitions(subTrees) {
@@ -105,24 +110,57 @@ private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInpu
         val tree = trees.next()
         assert(!trees.hasNext)
         childData.flatMap {
-          case (partID, (point, i)) =>
+          case (_, (point, i)) =>
             tree.query(point, $(k)).collect {
               case (neighbor, distance) if distance <= $(maxDistance) =>
-                ((partID, point.index), (partID, neighbor.vector.index, distance.toFloat))
+                (i, (neighbor.row, distance))
             }
         }
     }
 
     // merge results by point index together and keep topK results
-    results.topByKey($(k))(Ordering.by(-_._3))
-      .map { case (i, seq) => (i, seq.map(e => e._1 -> e._2)) }
+    results.topByKey($(k))(Ordering.by(-_._2))
+      .map { case (i, seq) => (i, seq) }
+  }
+  
+  
+  private[ml] def transformRELIEF(data: RDD[LPWithNorm], topTree: Broadcast[Tree], subTrees: RDD[Tree]) = {
+    val searchData = data.zipWithIndex()
+      .flatMap {
+        case (vector, queryIndex) =>
+          val idx = KNN.searchIndices(vector, topTree.value, $(bufferSize))
+            .map(i => (i, (vector, queryIndex)))
+
+          assert(idx.nonEmpty, s"indices must be non-empty: $vector ($queryIndex)")
+          idx
+      }.partitionBy(new HashPartitioner(subTrees.partitions.length)).cache()
+
+    // for each partition, search points within corresponding child tree
+    val results = searchData.zipPartitions(subTrees) {
+      (childData, trees) =>
+        val tree = trees.next()
+        assert(!trees.hasNext)
+        childData.flatMap {
+          case (partID, (point, queryIndex)) =>
+            tree.query(point, $(k)).collect {
+              case (neighbor, distance) if distance <= $(maxDistance) =>
+                (queryIndex, (partID, neighbor.vector.index, distance.toFloat))
+            }
+        }
+    }
+
+    // merge results by point index together and keep topK results
+    val neighborsByLocation = results.topByKey($(k))(Ordering.by(-_._3))
+      .flatMap { case (queryIndex, seq) => 
+        val groupedByPart = seq.groupBy(_._1).mapValues(_.map(_._2))
+        groupedByPart.map{ case(partID, lneighbors) => partID -> (queryIndex, lneighbors) }
+      }.partitionBy(new HashPartitioner(subTrees.partitions.length))
+    
+    (neighborsByLocation, searchData)
   }
 
-  private[ml] def transform(dataset: Dataset[_], topTree: Broadcast[Tree], subTrees: RDD[Tree]): RDD[(Long, Array[(Int, Int)])] = {
-    val input = dataset.selectExpr($(featuresCol), $(outputCol))
-      .rdd
-      .map(row => LabeledPoint(row.getAs[Double](1), row.getAs[Vector](0)))
-    transform(input, topTree, subTrees)
+  private[ml] def transform(dataset: Dataset[_], topTree: Broadcast[Tree], subTrees: RDD[Tree]): RDD[(Long, Array[(Row, Double)])] = {
+    transform(dataset.select($(featuresCol)).rdd.map(_.getAs[Vector](0)), topTree, subTrees)
   }
 
 }
@@ -249,34 +287,27 @@ class KNNModel private[ml](
   /** @group setParam */
   def setBufferSize(value: Double): this.type = set(bufferSize, value)
   
-  def nearestNeighbor(dataset: Dataset[_]): RDD[(Long, Array[(Int, Int)])] = {
-    transform(dataset, topTree, subTrees)
-  }
-  
-  def relief(dataset: Dataset[_]): RDD[(Long, Array[(Int, Int)])] = {
-    transform(dataset, topTree, subTrees)
-  }
 
   //TODO: All these can benefit from DataSet API
   override def transform(dataset: Dataset[_]): DataFrame = {
-    val merged: RDD[(Long, Array[(Int, Int)])] = transform(dataset, topTree, subTrees)
-
-    val withDistance = $(distanceCol).nonEmpty
-
-    dataset.sqlContext.createDataFrame(
-      dataset.toDF().rdd.zipWithIndex().map { case (row, i) => (i, row) }
-        .leftOuterJoin(merged)
-        .map {
-          case (i, (row, neighborsAndDistances)) =>
-            val (neighbors, distances) = neighborsAndDistances.map(_.unzip).getOrElse((Array.empty[Row], Array.empty[Double]))
-            if (withDistance) {
-              Row.fromSeq(row.toSeq :+ neighbors :+ distances)
-            } else {
-              Row.fromSeq(row.toSeq :+ neighbors)
-            }
-        },
-      transformSchema(dataset.schema)
-    )
+      val merged: RDD[(Long, Array[(Row,Double)])] = transform(dataset, topTree, subTrees)
+  
+      val withDistance = $(distanceCol).nonEmpty
+  
+      dataset.sqlContext.createDataFrame(
+        dataset.toDF().rdd.zipWithIndex().map { case (row, i) => (i, row) }
+          .leftOuterJoin(merged)
+          .map {
+            case (i, (row, neighborsAndDistances)) =>
+              val (neighbors, distances) = neighborsAndDistances.map(_.unzip).getOrElse((Array.empty[Row], Array.empty[Double]))
+              if (withDistance) {
+                Row.fromSeq(row.toSeq :+ neighbors :+ distances)
+              } else {
+                Row.fromSeq(row.toSeq :+ neighbors)
+              }
+          },
+        transformSchema(dataset.schema)
+      )
   }
 
   override def transformSchema(schema: StructType): StructType = {
@@ -406,7 +437,7 @@ class KNN(override val uid: String) extends Estimator[KNNModel] with KNNParams {
     val trees = repartitioned.mapPartitionsWithIndex {
       (partitionId, itr) =>
         val rand = new XORShiftRandom(byteswap64($(seed) ^ partitionId))
-        val indexed = itr.zipWithIndex.map{ case (v, i) => v.index = i; v}.toIndexedSeq
+        val indexed = itr.zipWithIndex.map{ case (v, i) => v.vector.index = i; v}.toIndexedSeq
         val childTree =
           HybridTree.build(indexed, $(subTreeLeafSize), tau, $(balanceThreshold), rand.nextLong())
 
@@ -435,10 +466,10 @@ object KNN {
     * VectorWithNorm can use more efficient algorithm to calculate distance
     */
   case class LPWithNorm(var index: Int, vector: LabeledPoint, norm: Double) {
-    def this(lp: LabeledPoint) = this(-1, lp, Vectors.norm(lp.features, 2))
+    def this(index: Int, lp: LabeledPoint) = this(-1, lp, Vectors.norm(lp.features, 2))
 
-    def this(vector: BV[Double]) = this(LabeledPoint(-1, Vectors.fromBreeze(vector)))
-    def this(vector: Vector) = this(LabeledPoint(-1, vector))
+    def this(vector: BV[Double]) = this(-1, LabeledPoint(-1, Vectors.fromBreeze(vector)))
+    def this(vector: Vector) = this(-1, LabeledPoint(-1, vector))
 
     def fastSquaredDistance(v: LPWithNorm): Double = {
       KNNUtils.fastSquaredDistance(vector.features, norm, v.vector.features, v.norm)
@@ -451,14 +482,10 @@ object KNN {
     * VectorWithNorm plus auxiliary row information
     */
   case class RowWithVector(vector: LPWithNorm, row: Row) {
-    def this(index: Int, lp: LabeledPoint, row: Row) = this(new LPWithNorm(lp), row)
-    def this(index: Int, vector: Vector, label: Double, row: Row) = this(new LPWithNorm(LabeledPoint(label, vector)), row)
-    
-    def this(index: Int, vector: RowWithVector) = this(vector.vector, vector.row)
+    def this(index: Int, lp: LabeledPoint, row: Row) = this(new LPWithNorm(index, lp), row)
+    def this(index: Int, vector: Vector, label: Double, row: Row) = this(new LPWithNorm(index, LabeledPoint(label, vector)), row)
     
   }
-  
-  case class RowWithVectorWithLocation(idxTree: Int, partIdx: Long, vector: LPWithNorm, row: Row)
   
   /**
     * Estimate a suitable buffer size based on dataset
