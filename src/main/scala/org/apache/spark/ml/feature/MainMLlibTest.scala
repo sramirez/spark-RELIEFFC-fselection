@@ -43,6 +43,7 @@ import org.apache.spark.mllib.linalg.{Vectors => OldVectors}
 import org.apache.spark.sql.types.StructField
 import org.apache.spark.ml.linalg.VectorUDT
 import org.apache.spark.ml.util.ModDiscretizerModel
+import org.apache.spark.ml.knn.KNN
 
 
 
@@ -93,7 +94,7 @@ object MainMLlibTest {
     
     val initStartTime = System.nanoTime()
     
-    val conf = new SparkConf().setAppName("CollisionFS Test")//.setMaster("local[*]").set("spark.driver.memory", "16g").set("spark.executor.memory", "16g")
+    val conf = new SparkConf().setAppName("CollisionFS Test")//.setMaster("local[*]").set("spark.driver.memory", "8g").set("spark.executor.memory", "8g")
     val sc = new SparkContext(conf)
     sqlContext = new SQLContext(sc)
     println("Usage: MLlibTest --train-file=\"hdfs://blabla\" --nselect=10 --npart=1 --continuous=false --k=5 --discretize=false --padded=2 --class-last=true --header=false")
@@ -145,8 +146,8 @@ object MainMLlibTest {
     println("# of examples readed and processed: " + nelems)
        
     
-    if(mode == "test-lsh"){
-      this.testLSHPerformance(df, nelems)
+    if(mode == "test-mtree"){
+      this.testMTREEPerformance(df, nelems)
     } else if(mode == "final") {
       testFinalSelector(df, nelems)
     } else {
@@ -667,35 +668,33 @@ object MainMLlibTest {
     model
   }
   
-  def testLSHPerformance(df: Dataset[_], nelems: Long) {
+  def testMTREEPerformance(df: Dataset[_], nelems: Long) {
     
     val nFeat = df.select(inputLabel).head().getAs[Vector](0).size
     val kfold = 3
     
-    val brp = new BucketedRandomLSH()
-      .setNumHashTables(numHashTables)
-      .setInputCol(inputLabel)
-      .setOutputCol("hashCol")
-      .setBucketLength(bucketWidth)
-      .setSignatureSize(signatureSize)
-      .setSparseSpeedup(sparseSpeedup)
-      .setSeed(seed)
-   var model = brp.fit(df)
+    val knn = new KNN()
+        .setFeaturesCol(inputLabel)
+        .setAuxCols(Array(inputLabel))
+        .setOutputCol(clsLabel)
+        .setTopTreeSize(5)
+        .setK(k)
+        .setSeed(seed)
+    var knnModel = knn.fit(df).setNeighborsCol("NEIGHBORS").setDistanceCol("distance")
       
       // Sample only some elements to test
-    val samplingRate = sampling * kfold / nelems.toDouble // k-fold cross validation, k = 10
+    val samplingRate = math.min(1.0, sampling * kfold / nelems.toDouble) // k-fold cross validation, k = 10
     val keys = df.select(inputLabel).sample(false, samplingRate, seed).collect()
     println("Number of examples used in estimation: " + keys.length)
     
     var sumer = 0.0; var sump = 0.0; var sumr = 0.0; var red = 0L; var sumtime = 0.0; 
     var sumMax = 0.0; var maxd = 0.0; var cont = 0
     keys.foreach { case Row(key: Vector) =>  
-      val (errorRatio, precision, recall, redundancy, time) = LSHTest.calculateApproxNearestNeighbors(
-          model, df, key, k, "multi", "distCol", nelems) 
+      val (errorRatio, precision, recall, redundancy, time) = knnModel.calculateApproxNearestNeighbors(df, key, nelems) 
       sump += precision; sumr += recall; sumtime += time; sumer += errorRatio
       cont += 1
-      if(cont % kfold == 0)
-        model = brp.fit(df)
+      //if(cont % kfold == 0)
+        //knnModel = knn.fit(df)
       println("# instances completed: " + cont)
     }
     

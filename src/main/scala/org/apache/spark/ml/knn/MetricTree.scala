@@ -31,7 +31,10 @@ private[ml] abstract class Tree extends Serializable {
    * @return a list of neighbor that is nearest to the query vector
    */
   def query(v: Vector, k: Int = 1): Iterable[(RowWithVector, Double)] = query(new LPWithNorm(v), k)
-  def query(v: LPWithNorm, k: Int): Iterable[(RowWithVector, Double)] = query(new KNNCandidates(v, k)).toIterable
+  def query(v: LPWithNorm, k: Int): Iterable[(RowWithVector, Double)] = {
+    val test = query(new KNNCandidates(v, k))
+    test.toIterable
+  }
 
   /**
    * Refine k-NN candidates using data in this [[Tree]]

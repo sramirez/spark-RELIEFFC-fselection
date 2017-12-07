@@ -26,6 +26,9 @@ import org.apache.spark.ml.feature.VectorAccumulator
 import org.apache.spark.ml.feature.MatrixAccumulator
 import scala.collection.mutable.Queue
 
+import org.apache.spark.sql.functions.udf
+
+import org.apache.spark.sql.functions.col
 // features column => vector, input columns => auxiliary columns to return by KNN model
 private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInputCols with HasOutputCol {
   /**
@@ -91,7 +94,7 @@ private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInpu
   def getBufferSize: Double = $(bufferSize)
 
   
-  private[ml] def transform(data: RDD[Vector], topTree: Broadcast[Tree], subTrees: RDD[Tree]): RDD[(Long, Array[(Row,Double)])] = {
+  private[ml] def transform(data: RDD[Vector], topTree: Broadcast[Tree], subTrees: RDD[Tree]): RDD[(Long, Array[(RowWithVector,Double)])] = {
     val searchData = data.zipWithIndex()
       .flatMap {
         case (vector, index) =>
@@ -113,7 +116,7 @@ private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInpu
           case (_, (point, i)) =>
             tree.query(point, $(k)).collect {
               case (neighbor, distance) if distance <= $(maxDistance) =>
-                (i, (neighbor.row, distance))
+                (i, (neighbor, distance))
             }
         }
     }
@@ -159,7 +162,7 @@ private[ml] trait KNNModelParams extends Params with HasFeaturesCol with HasInpu
     (neighborsByLocation, searchData)
   }
 
-  private[ml] def transform(dataset: Dataset[_], topTree: Broadcast[Tree], subTrees: RDD[Tree]): RDD[(Long, Array[(Row, Double)])] = {
+  private[ml] def transform(dataset: Dataset[_], topTree: Broadcast[Tree], subTrees: RDD[Tree]): RDD[(Long, Array[(RowWithVector, Double)])] = {
     transform(dataset.select($(featuresCol)).rdd.map(_.getAs[Vector](0)), topTree, subTrees)
   }
 
@@ -290,7 +293,7 @@ class KNNModel private[ml](
 
   //TODO: All these can benefit from DataSet API
   override def transform(dataset: Dataset[_]): DataFrame = {
-      val merged: RDD[(Long, Array[(Row,Double)])] = transform(dataset, topTree, subTrees)
+      val merged: RDD[(Long, Array[(RowWithVector,Double)])] = transform(dataset, topTree, subTrees)
   
       val withDistance = $(distanceCol).nonEmpty
   
@@ -299,7 +302,7 @@ class KNNModel private[ml](
           .leftOuterJoin(merged)
           .map {
             case (i, (row, neighborsAndDistances)) =>
-              val (neighbors, distances) = neighborsAndDistances.map(_.unzip).getOrElse((Array.empty[Row], Array.empty[Double]))
+              val (neighbors, distances) = neighborsAndDistances.map{ _.map{case (lp, d) => lp.row -> d}.unzip}.getOrElse((Array.empty[Row], Array.empty[Double]))
               if (withDistance) {
                 Row.fromSeq(row.toSeq :+ neighbors :+ distances)
               } else {
@@ -323,6 +326,45 @@ class KNNModel private[ml](
   override def copy(extra: ParamMap): KNNModel = {
     val copied = new KNNModel(uid, topTree, subTrees)
     copyValues(copied, extra).setParent(parent)
+  }
+  
+    /**
+   * Compute the precision and recall of approximate nearest neighbors
+   * @param lsh The lsh instance
+   * @param dataset the dataset to look for the key
+   * @param key The key to hash for the item
+   * @param k The maximum number of items closest to the key
+   * @param singleProbe True for using single-probe; false for multi-probe
+   * @tparam T The class type of lsh
+   * @return A tuple of two doubles, representing precision and recall rate
+   */
+  def calculateApproxNearestNeighbors(
+      dataset: Dataset[_],
+      key: Vector,
+      nelems: Long) = {
+
+    // Compute real neighbors
+    val distUDF = udf((x: Vector) => math.sqrt(Vectors.sqdist(x, key)), DataTypes.DoubleType)
+    val modelDatasetWithDist = dataset.withColumn("realDistance", distUDF(col($(featuresCol))))
+    implicit def rowOrder: Ordering[Row] = Ordering.by{_.getAs[Double]("realDistance")}
+    val expected = modelDatasetWithDist.rdd.takeOrdered($(k))(rowOrder)
+    val nexpected = expected.length
+    
+    // Compute query time
+    val s = System.currentTimeMillis()
+    val singleRDD = dataset.sparkSession.sparkContext.parallelize(Array(key))
+    val actual = transform(singleRDD, topTree, subTrees).values.first().sortBy(_._2)
+    val nactual = actual.length
+    val queryTime = (System.currentTimeMillis() - s) / 1000 // in s
+    
+    // Compute precision and recall
+    val error = actual.zip(expected).map{ 
+      case(r1,r2) =>
+        (r1._2 + 1) / (r2.getAs[Double]("realDistance") + 1)
+    }.sum
+    //val intputCol = model.getInputCol
+    val correctCount = expected.map { _.getAs[Vector]($(featuresCol)) }.intersect(actual.map{_._1.vector.vector.features}).length.toDouble
+    (error / math.min(nactual, nexpected), correctCount / nactual, correctCount / nexpected, 1.0, queryTime)
   }
 }
 
@@ -417,7 +459,7 @@ class KNN(override val uid: String) extends Estimator[KNNModel] with KNNParams {
     //prepare data for model estimation
     val data = dataset.selectExpr($(featuresCol), $(inputCols).mkString("struct(", ",", ")"), $(outputCol))
       .rdd
-      .map(row => new RowWithVector(-1, row.getAs[Vector](0), row.getAs[Double](3), row.getStruct(1)))
+      .map(row => new RowWithVector(-1, row.getAs[Vector](0), row.getAs[Double](2), row.getStruct(1)))
     //sample data to build top-level tree
     val sampled = data.sample(withReplacement = false, $(topTreeSize).toDouble / dataset.count(), rand.nextLong()).collect()
     val topTree = MetricTree.build(sampled, $(topTreeLeafSize), rand.nextLong())
@@ -476,6 +518,7 @@ object KNN {
     }
 
     def fastDistance(v: LPWithNorm): Double = math.sqrt(fastSquaredDistance(v))
+
   }
 
   /**

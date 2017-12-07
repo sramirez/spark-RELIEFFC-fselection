@@ -210,10 +210,13 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val hashOutputCol = "hashRELIEF_" + System.currentTimeMillis()
     val knn = new KNN()
         .setFeaturesCol($(inputCol))
+        .setAuxCols(Array($(inputCol)))
         .setOutputCol($(labelCol))
+        //.setTopTreeSize(5)
         .setK($(numNeighbors))
+        .setSeed($(seed))
     val knnModel = knn.fit(dataset)
-    val modelDataset: RDD[KNN.LPWithNorm] = knnModel.subTrees.mapPartitions{it => it.next.iterator.map(_.vector)}
+    val modelDataset: RDD[KNN.LPWithNorm] = knnModel.subTrees.mapPartitions{it => it.next.iterator.map(_.vector)}.cache()
     
     // Get some basic information about the dataset
     val sc = dataset.sparkSession.sparkContext
@@ -267,7 +270,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         case sv: BSV[Double] => sv += partialMarginal.value.asInstanceOf[BSV[Double]]
         case dv: BDV[Double] => dv += partialMarginal.value
       }
-      //println("# omitted instances in this step: " + skipped)
         
       // Free some resources
       references.unpersist()
@@ -350,7 +352,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         val jointVote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else 
                       (i1: Int, _: Int) => pcounter(i1)
                       
-        neigs.map{ case(_, (rid, vtid)) =>
+        neigs.foreach{ case(_, (rid, vtid)) =>
             referenceTable.get(rid) match { 
               case Some(ref) =>
                 vtid.foreach{ tid =>
@@ -394,6 +396,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                         }                        
                         mainCollisioned.clear(); auxCollisioned.clear()
                     case None => /* Do nothing */
+                      System.err.println("Instance does not found in the table")
                   }  
                 }                
               case None =>
@@ -584,7 +587,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           dv.mapActivePairs{case (i2, value) => applyEntropy(i1, i2, value)}
       }
       i1 -> (w, Vectors.fromBreeze(res))
-    }
+    }.cache()
     
     val maxRed = entropyWeights.values.map{ case (_, joint) => joint.asBreeze.max}.max
     val minRed = entropyWeights.values.map{ case (_, joint) => joint.asBreeze.min}.min
