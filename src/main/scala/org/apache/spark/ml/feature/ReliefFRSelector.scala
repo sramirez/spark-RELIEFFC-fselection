@@ -217,21 +217,21 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         .setK($(numNeighbors))
         .setSeed($(seed))
     val knnModel = knn.fit(dataset)
-    val modelDataset: RDD[KNN.LPWithNorm] = knnModel.subTrees.mapPartitions{it => it.next.iterator.map(_.vector)}.cache()
+    val modelDataset: RDD[KNN.LPWithNorm] = knnModel.subTrees.mapPartitions{it => it.next.iterator}.cache()
     
     // Get some basic information about the dataset
     val sc = dataset.sparkSession.sparkContext
     val spark = dataset.sparkSession.sqlContext
-    val nElems = modelDataset.count() // needed to persist the training set
-    val first = modelDataset.first().vector
-    val sparse = first.features.isInstanceOf[SparseVector]
-    val nFeat = first.features.size
+    val nElems = dataset.count() // needed to persist the training set
+    val first = dataset.toDF().first().getAs[Vector]($(inputCol))
+    val sparse = first.isInstanceOf[SparseVector]
+    val nFeat = first.size
     val lowerFeat = math.max($(numTopFeatures), math.round($(lowerFeatureThreshold).toFloat * $(numTopFeatures))) // 0 is the min, 0.5 the median
-    val priorClass = modelDataset.map{ _.vector.label }
+    val priorClass = dataset.select($(labelCol)).rdd.map{ case Row(label: Double) => label }
         .countByValue()
         .mapValues(v => (v.toDouble / nElems).toFloat)
         .map(identity).toMap
-            
+
     val weights = Array.fill((1 / $(batchSize)).toInt)($(batchSize))
     
     val batches = modelDataset.sample(false, $(estimationRatio)).randomSplit(weights, $(seed))
@@ -335,8 +335,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val isCont = !$(discreteData); val lowerDistanceTh = $(lowerDistanceThreshold); val icol = $(inputCol); val lcol = $(labelCol)
         
     val rawReliefWeights = subTrees.zipPartitions(neighbors, searchData){ (trees, neigs, refs) =>
-        val referenceTable = refs.map{case (_, (lpwn, id)) => id -> lpwn.vector}.toMap
-        val treeTable = trees.next().iterator.map(e => e.vector.index -> e.vector.vector).toMap
+        val referenceTable = refs.map{case (_, (lpwn, id)) => id -> lpwn.lp}.toMap
+        val treeTable = trees.next().iterator.map(e => e.index -> e.lp).toMap
         
         // last position is reserved to negative weights from central instances.
         val marginal = BDV.zeros[Double](nFeat)
