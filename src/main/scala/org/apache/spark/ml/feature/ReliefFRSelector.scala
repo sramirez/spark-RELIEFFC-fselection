@@ -208,11 +208,12 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     // Get Hash Value of the key 
     val hashOutputCol = "hashRELIEF_" + System.currentTimeMillis()
+    val topTreeSize = 920 * 5
     val knn = new KNN()
         .setFeaturesCol($(inputCol))
         .setAuxCols(Array($(inputCol)))
         .setOutputCol($(labelCol))
-        //.setTopTreeSize(5)
+        .setTopTreeSize(topTreeSize)
         .setK($(numNeighbors))
         .setSeed($(seed))
     val knnModel = knn.fit(dataset)
@@ -256,8 +257,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       
       // Normalize previous results and return the best features
       results(i) = rawWeights.cache() 
-      
-      val localR = results(i).collect()
       if(results(i).count > 0){ // call the action required to persist data
         val normalized = normalizeRankingDF(results(i).mapValues(_._1))
         implicit def scoreOrder: Ordering[(Int, Float)] = Ordering.by{ _._2 }
