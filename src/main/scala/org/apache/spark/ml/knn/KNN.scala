@@ -462,11 +462,12 @@ class KNN(override val uid: String) extends Estimator[KNNModel] with KNNParams {
       .map(row => new LPWithNorm(-1, LabeledPoint(row.getAs[Double](1), row.getAs[Vector](0))))
     //sample data to build top-level tree
     val sampled = data.sample(withReplacement = false, $(topTreeSize).toDouble / dataset.count(), rand.nextLong()).collect()
-    val topTree = MetricTree.build(sampled, $(topTreeLeafSize), rand.nextLong())
+    val bTopTree = data.sparkContext.broadcast(MetricTree.build(sampled, $(topTreeLeafSize), rand.nextLong()))
     //build partitioner using top-level tree
-    val part = new KNNPartitioner(topTree)
+    //val part = new KNNPartitioner(btopTree)
     //noinspection ScalaStyle
-    val repartitioned = new ShuffledRDD[LPWithNorm, Null, Null](data.map(v => (v, null)), part).keys
+    val repartitioned = data.map(v => (v, null)).partitionBy(new KNNPartitioner(bTopTree)).keys
+    //val repartitioned = new ShuffledRDD[LPWithNorm, Null, Null](data.map(v => (v, null)), part).keys
 
     val tau =
       if ($(balanceThreshold) > 0 && $(bufferSize) < 0) {
@@ -484,11 +485,11 @@ class KNN(override val uid: String) extends Estimator[KNNModel] with KNNParams {
           HybridTree.build(indexed, $(subTreeLeafSize), tau, $(balanceThreshold), rand.nextLong())
 
         Iterator(childTree)
-    }.persist(StorageLevel.MEMORY_AND_DISK)
+    }.persist(StorageLevel.MEMORY_ONLY)
     // TODO: force persisting trees primarily for benchmark. any reason not to do this for regular runs?
     trees.count()
 
-    val model = new KNNModel(uid, trees.context.broadcast(topTree), trees).setParent(this)
+    val model = new KNNModel(uid, bTopTree, trees).setParent(this)
     copyValues(model).setBufferSize(tau)
   }
 
@@ -646,12 +647,12 @@ object KNN {
     *
     * @param tree `Tree` used to find leaf
     */
-  class KNNPartitioner[T <: LPWithNorm](tree: Tree) extends Partitioner {
-    override def numPartitions: Int = tree.leafCount
+  class KNNPartitioner[T <: LPWithNorm](tree: Broadcast[Tree]) extends Partitioner {
+    override def numPartitions: Int = tree.value.leafCount
 
     override def getPartition(key: Any): Int = {
       key match {
-        case v: LPWithNorm => searchIndex(v, tree)
+        case v: LPWithNorm => searchIndex(v, tree.value)
         case _ => throw new IllegalArgumentException(s"Key must be of type Vector but got: $key")
       }
     }

@@ -217,7 +217,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         .setK($(numNeighbors))
         .setSeed($(seed))
     val knnModel = knn.fit(dataset)
-    val modelDataset: RDD[KNN.LPWithNorm] = knnModel.subTrees.mapPartitions{it => it.next.iterator}.cache()
     
     // Get some basic information about the dataset
     val sc = dataset.sparkSession.sparkContext
@@ -234,6 +233,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
 
     val weights = Array.fill((1 / $(batchSize)).toInt)($(batchSize))
     
+    val modelDataset: RDD[KNN.LPWithNorm] = knnModel.subTrees.mapPartitions(_.next.iterator)
     val batches = modelDataset.sample(false, $(estimationRatio)).randomSplit(weights, $(seed))
     var featureWeights: BV[Float] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
     var marginalVector: BV[Double] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)

@@ -141,15 +141,15 @@ object MainMLlibTest {
     
     val rawDF = TestHelper.readData(sqlContext, pathFile, firstHeader, format)
     val partDF = if(repartition) rawDF.repartition(nPartitions).cache else rawDF.coalesce(nPartitions)
-    val df = preProcess(partDF).select(clsLabel, inputLabel).cache()
-    val nelems = df.count()
-    println("# of examples readed and processed: " + nelems)
+    val df = preProcess(partDF).select(clsLabel, inputLabel)
+    //val nelems = df.count()
+    //println("# of examples readed and processed: " + nelems)
        
     
     if(mode == "test-mtree"){
-      this.testMTREEPerformance(df, nelems)
+      this.testMTREEPerformance(df)
     } else if(mode == "final") {
-      testFinalSelector(df, nelems)
+      testFinalSelector(df)
     } else {
       doRELIEFComparison(df)
     }
@@ -668,8 +668,9 @@ object MainMLlibTest {
     model
   }
   
-  def testMTREEPerformance(df: Dataset[_], nelems: Long) {
+  def testMTREEPerformance(df: Dataset[_]) {
     
+    val nelems = df.count()
     val nFeat = df.select(inputLabel).head().getAs[Vector](0).size
     val kfold = 3
     
@@ -711,7 +712,7 @@ object MainMLlibTest {
     
   }
   
-  def testFinalSelector(df: Dataset[Row], nElems: Long) {
+  def testFinalSelector(df: Dataset[Row]) {
     
     val nFeat = df.head().getAs[Vector](inputLabel).size
     println("Total features: " + nFeat)
