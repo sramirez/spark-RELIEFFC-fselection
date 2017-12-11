@@ -245,7 +245,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             
     val sampledSize = math.floor($(estimationRatio) * nElems)
     val maxWeight = math.ceil(Integer.MAX_VALUE / 8 / (nFeat + 2) / sampledSize) // nfeat + id + label + extra pad
-    val weight = math.min($(batchSize), maxWeight)
+    val weight = math.min($(batchSize), maxWeight / sampledSize)
     val weights = Array.fill((1 / weight).toInt)(weight)
     val batches = modelDataset.sample(false, $(estimationRatio)).randomSplit(weights, $(seed))
     var featureWeights: BV[Float] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
