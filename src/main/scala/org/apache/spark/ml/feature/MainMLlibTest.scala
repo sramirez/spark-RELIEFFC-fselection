@@ -95,7 +95,7 @@ object MainMLlibTest {
     
     val initStartTime = System.nanoTime()
     
-    val conf = new SparkConf().setAppName("CollisionFS Test").setMaster("local[*]").set("spark.driver.memory", "16g").set("spark.executor.memory", "16g")
+    val conf = new SparkConf().setAppName("CollisionFS Test")//.setMaster("local[*]").set("spark.driver.memory", "16g").set("spark.executor.memory", "16g")
     val sc = new SparkContext(conf)
     sqlContext = new SQLContext(sc)
     println("Usage: MLlibTest --train-file=\"hdfs://blabla\" --nselect=10 --npart=1 --continuous=false --k=5 --discretize=false --padded=2 --class-last=true --header=false")
