@@ -43,6 +43,8 @@ import org.apache.spark.mllib.linalg.{Vectors => OldVectors}
 import org.apache.spark.sql.types.StructField
 import org.apache.spark.ml.linalg.VectorUDT
 import org.apache.spark.ml.util.ModDiscretizerModel
+import org.apache.spark.mllib.classification.SVMWithSGD
+import org.apache.spark.ml.classification.LinearSVC
 
 
 
@@ -388,7 +390,8 @@ object MainMLlibTest {
       //new Pipeline().setStages(Array(dt))
 
     } else {
-      new LogisticRegression()
+      new LinearSVC()
+        .setStandardization(false)
         .setFeaturesCol(inputCol)
         .setLabelCol(labelCol) 
     }
@@ -737,8 +740,8 @@ object MainMLlibTest {
     
     val now = System.currentTimeMillis
     val dataname = pathFile.split("/").last.split("-").head
-    val modelPath = "RELIEF-model-" + dataname + "-" + numHashTables + "-" + bucketWidth + "-" +
-        signatureSize + "-" + k + "-" + estimationRatio + "-" + batchSize + "-" + lowerFeatThreshold
+    val modelPath = "RELIEF-model-" + dataname + "-" + numHashTables + bucketWidth +
+        signatureSize + k + estimationRatio + batchSize + lowerFeatThreshold
     var model: ReliefFRSelectorModel = null
     try {
         model = ReliefFRSelectorModel.load(modelPath)
@@ -752,11 +755,9 @@ object MainMLlibTest {
     val runtime = (System.currentTimeMillis - now) / 1000
     println("RELIEF-F model training time (seconds) = " + runtime)
     
-    val reliefCollModel = model.setRedundancyRemoval(true).setReducedSubset(nselect.max)
-    val reliefModel = model.setRedundancyRemoval(false).setReducedSubset(nselect.max)
-    val outRC = reliefCollModel.getSelectedFeatures().mkString("\n")
-    val outR = reliefModel.getSelectedFeatures().mkString("\n")
+    val outRC = model.setRedundancyRemoval(true).setReducedSubset(nselect.max).getSelectedFeatures().mkString("\n")
     println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
+    val outR = model.setRedundancyRemoval(false).setReducedSubset(nselect.max).getSelectedFeatures().mkString("\n")
     println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
     
     if(predict) {
@@ -767,10 +768,9 @@ object MainMLlibTest {
       
       // Print best features according to the RELIEF-F measure
       nselect.reverse.foreach{ nfeat => 
-        val reliefCollModel = model.setRedundancyRemoval(true).setReducedSubset(nfeat)
-        val reliefModel = model.setRedundancyRemoval(false).setReducedSubset(nfeat)
-        val outRC = reliefCollModel.getSelectedFeatures().mkString("\n")
-        val outR = reliefModel.getSelectedFeatures().mkString("\n")
+        val partialModel = model.setReducedSubset(nfeat)
+        val outRC = partialModel.setRedundancyRemoval(true).getSelectedFeatures().mkString("\n")
+        val outR = partialModel.setRedundancyRemoval(false).getSelectedFeatures().mkString("\n")
         println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
         println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
         
@@ -783,22 +783,21 @@ object MainMLlibTest {
           println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
           val reducedMRMR = mRMRmodel.transform(testDF).cache()
           mrmrAccDT = holdOutPerformance(df, reducedMRMR, "dt")
-          mrmrAccLR = holdOutPerformance(df, reducedMRMR, "lr")
+          mrmrAccLR = holdOutPerformance(df, reducedMRMR, "svc")
           selectedMRMR = mRMRmodel.selectedFeatures.map(_ + 1).mkString(",")
           reducedMRMR.unpersist()
         }
           
-        val reducedRC = reliefCollModel.transform(testDF).cache()
-        val tReducedRC = reliefCollModel.transform(testDF).cache()
+        val reducedRC = partialModel.setRedundancyRemoval(true).transform(df).cache()
+        val tReducedRC = partialModel.setRedundancyRemoval(true).transform(testDF).cache()
         val relCAccDT = holdOutPerformance(reducedRC, tReducedRC, "dt") 
-        val relCAccLR = holdOutPerformance(reducedRC, tReducedRC, "lr") 
+        val relCAccLR = holdOutPerformance(reducedRC, tReducedRC, "svc") 
         reducedRC.unpersist(); tReducedRC.unpersist()
         
-        
-        val reducedR = reliefModel.transform(testDF).cache()
-        val tReducedR = reliefModel.transform(testDF).cache()
+        val reducedR = partialModel.setRedundancyRemoval(false).transform(df).cache()
+        val tReducedR = partialModel.setRedundancyRemoval(false).transform(testDF).cache()
         val relAccDT = holdOutPerformance(reducedR, tReducedR, "dt") 
-        val relAccLR = holdOutPerformance(reducedR, tReducedR, "lr") 
+        val relAccLR = holdOutPerformance(reducedR, tReducedR, "svc") 
         reducedR.unpersist(); tReducedR.unpersist()
         
         val accDT = holdOutPerformance(df, testDF, "dt") 

@@ -243,7 +243,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         .mapValues(v => (v.toDouble / nElems).toFloat)
         .map(identity).toMap
             
-    val weights = Array.fill((1 / $(batchSize)).toInt)($(batchSize))
+    val sampledSize = math.floor($(estimationRatio) * nElems)
+    val maxWeight = math.ceil(Integer.MAX_VALUE / 8 / (nFeat + 2) / sampledSize) // nfeat + id + label + extra pad
+    val weight = math.min($(batchSize), maxWeight)
+    val weights = Array.fill((1 / weight).toInt)(weight)
     val batches = modelDataset.sample(false, $(estimationRatio)).randomSplit(weights, $(seed))
     var featureWeights: BV[Float] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
     var marginalVector: BV[Double] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
@@ -802,14 +805,15 @@ final class ReliefFRSelectorModel private[ml] (
   }
   
   def getReducedSubsetParam(): Int = subset
-  def getSelectedFeatures(): Array[Int] = if($(redundancyRemoval)) reliefFeatures else reliefColFeatures
+  def getSelectedFeatures(): Array[Int] = if($(redundancyRemoval)) reliefColFeatures else reliefFeatures
 
   override def transform(dataset: Dataset[_]): DataFrame = {
     val transformedSchema = transformSchema(dataset.schema, logging = true)
     val newField = transformedSchema.last
 
     // TODO: Make the transformer natively in ml framework to avoid extra conversion.
-    val sfeat = getSelectedFeatures().slice(0, subset)
+    val sfeat = getSelectedFeatures().slice(0, subset).sorted
+    // sfeat must be ordered asc
     val transformer: Vector => Vector = v =>  FeatureSelectionUtils.compress(OldVectors.fromML(v), sfeat).asML
     val selector = udf(transformer)
 
