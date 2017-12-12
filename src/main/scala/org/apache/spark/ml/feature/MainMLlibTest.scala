@@ -45,6 +45,7 @@ import org.apache.spark.ml.linalg.VectorUDT
 import org.apache.spark.ml.util.ModDiscretizerModel
 import org.apache.spark.mllib.classification.SVMWithSGD
 import org.apache.spark.ml.classification.LinearSVC
+import org.apache.spark.storage.StorageLevel
 
 
 
@@ -362,36 +363,13 @@ object MainMLlibTest {
         .setLabelCol(labelCol)    
      
     } else if(classifier == "dt") {
-      val labelIndexer = new StringIndexer()
-          .setInputCol(labelCol)
-          .setOutputCol("indexedLabel")
-          .fit(df)
-      labelCol = "indexedLabel"    
-      // Automatically identify categorical features, and index them.
-      val featureIndexer = new VectorIndexer()
-        .setInputCol(inputCol)
-        .setOutputCol("indexedFeatures")
-        .setMaxCategories(15) // features with > 4 distinct values are treated as continuous.
-        .fit(df)
-        
-      inputCol = "indexedFeatures"
-      
-      val dt = new DecisionTreeClassifier()
+      // all features have been indexed previously in the preProcess method (label included).
+      new DecisionTreeClassifier()
         .setFeaturesCol(inputCol)
         .setLabelCol(labelCol)  
-        
-      // Convert indexed labels back to original labels.
-      val labelConverter = new IndexToString()
-        .setInputCol("prediction")
-        .setOutputCol("predictedLabel")
-        .setLabels(labelIndexer.labels)
-        
-      new Pipeline().setStages(Array(labelIndexer, featureIndexer, dt, labelConverter))
-      //new Pipeline().setStages(Array(dt))
-
+      
     } else {
       new LinearSVC()
-        .setStandardization(false)
         .setFeaturesCol(inputCol)
         .setLabelCol(labelCol) 
     }
@@ -401,11 +379,14 @@ object MainMLlibTest {
         .setPredictionCol("prediction")
         .setMetricName("accuracy")
         
-        
     //K-folding operation starting
     //for each fold you have multiple models created cfm. the paramgrid
-    val model = estimator.fit(df)
+    val input = df.select(clsLabel, inputCol); val state = input.storageLevel
+    val persistedInput = if(state == StorageLevel.NONE) input.cache() else input // avoid duplicates
+    val model = estimator.fit(input)
     val acc = evaluator.evaluate(model.transform(test))
+    if(state == StorageLevel.NONE) 
+      input.unpersist()
     if(!acc.isNaN()){
       acc
     } else {
@@ -739,7 +720,7 @@ object MainMLlibTest {
       .setDiscreteData(!continuous)
     
     val now = System.currentTimeMillis
-    val dataname = pathFile.split("/").last.split("-").head
+    val dataname = pathFile.split("/").last.split(Array('-','.','_')).head
     val modelPath = "RELIEF-model-" + dataname + "-" + numHashTables + bucketWidth +
         signatureSize + k + estimationRatio + batchSize + lowerFeatThreshold
     var model: ReliefFRSelectorModel = null
@@ -781,24 +762,22 @@ object MainMLlibTest {
           val runtime = (System.currentTimeMillis - now) / 1000
           println("mRMR model training time (in s) = " + runtime)
           println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
-          val reducedMRMR = mRMRmodel.transform(testDF).cache()
-          mrmrAccDT = holdOutPerformance(df, reducedMRMR, "dt")
-          mrmrAccLR = holdOutPerformance(df, reducedMRMR, "svc")
+          val treducedMRMR = mRMRmodel.transform(df)
+          val reducedMRMR = mRMRmodel.transform(testDF)
+          mrmrAccDT = holdOutPerformance(treducedMRMR, reducedMRMR, "dt")
+          mrmrAccLR = holdOutPerformance(treducedMRMR, reducedMRMR, "svc")
           selectedMRMR = mRMRmodel.selectedFeatures.map(_ + 1).mkString(",")
-          reducedMRMR.unpersist()
         }
           
-        val reducedRC = partialModel.setRedundancyRemoval(true).transform(df).cache()
-        val tReducedRC = partialModel.setRedundancyRemoval(true).transform(testDF).cache()
+        val reducedRC = partialModel.setRedundancyRemoval(true).transform(df)
+        val tReducedRC = partialModel.setRedundancyRemoval(true).transform(testDF)
         val relCAccDT = holdOutPerformance(reducedRC, tReducedRC, "dt") 
         val relCAccLR = holdOutPerformance(reducedRC, tReducedRC, "svc") 
-        reducedRC.unpersist(); tReducedRC.unpersist()
         
-        val reducedR = partialModel.setRedundancyRemoval(false).transform(df).cache()
-        val tReducedR = partialModel.setRedundancyRemoval(false).transform(testDF).cache()
+        val reducedR = partialModel.setRedundancyRemoval(false).transform(df)
+        val tReducedR = partialModel.setRedundancyRemoval(false).transform(testDF)
         val relAccDT = holdOutPerformance(reducedR, tReducedR, "dt") 
         val relAccLR = holdOutPerformance(reducedR, tReducedR, "svc") 
-        reducedR.unpersist(); tReducedR.unpersist()
         
         val accDT = holdOutPerformance(df, testDF, "dt") 
         val accLR = holdOutPerformance(df, testDF, "lr")        
