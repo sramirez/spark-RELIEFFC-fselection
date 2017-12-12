@@ -46,6 +46,7 @@ import org.apache.spark.ml.util.ModDiscretizerModel
 import org.apache.spark.mllib.classification.SVMWithSGD
 import org.apache.spark.ml.classification.LinearSVC
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.ml.evaluation.BinaryClassificationEvaluator
 
 
 
@@ -374,24 +375,42 @@ object MainMLlibTest {
         .setLabelCol(labelCol) 
     }
     
-    val evaluator = new MulticlassClassificationEvaluator()
+    val evacc = new MulticlassClassificationEvaluator()
         .setLabelCol(labelCol)
         .setPredictionCol("prediction")
         .setMetricName("accuracy")
+
+    val evf1 = new MulticlassClassificationEvaluator()
+        .setLabelCol(labelCol)
+        .setPredictionCol("prediction")
+        .setMetricName("f1")
+        
+    val evrecall = new MulticlassClassificationEvaluator()
+        .setLabelCol(labelCol)
+        .setPredictionCol("prediction")
+        .setMetricName("weightedRecall")
+        
+    val evPred = new MulticlassClassificationEvaluator()
+        .setLabelCol(labelCol)
+        .setPredictionCol("prediction")
+        .setMetricName("weightedPrecision")
+        
+        
         
     //K-folding operation starting
     //for each fold you have multiple models created cfm. the paramgrid
     val input = df.select(clsLabel, inputCol); val state = input.storageLevel
     val persistedInput = if(state == StorageLevel.NONE) input.cache() else input // avoid duplicates
     val model = estimator.fit(input)
-    val acc = evaluator.evaluate(model.transform(test))
+    val predictions = model.transform(test)
+    val acc = evacc.evaluate(predictions)
+    val recall = evrecall.evaluate(predictions)
+    val prec = evPred.evaluate(predictions)
+    val f1 = evf1.evaluate(predictions)
+    
     if(state == StorageLevel.NONE) 
       input.unpersist()
-    if(!acc.isNaN()){
-      acc
-    } else {
-      0.0d
-    }
+    (acc, recall, prec, f1)
   }
   
   def kCVPerformance(df: Dataset[Row], classifier: String) = {
@@ -755,7 +774,7 @@ object MainMLlibTest {
         println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
         println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
         
-        var mrmrAcc = 0.0; var mrmrAccDT = 0.0; var mrmrAccLR = 0.0; var selectedMRMR = new String();
+        var mrmrAccDT = ""; var mrmrAccLR = ""; var selectedMRMR = new String();
         if(mrmr){    
           val now = System.currentTimeMillis
           val mRMRmodel = fitMRMR(df)
@@ -764,32 +783,32 @@ object MainMLlibTest {
           println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
           val treducedMRMR = mRMRmodel.transform(df)
           val reducedMRMR = mRMRmodel.transform(testDF)
-          mrmrAccDT = holdOutPerformance(treducedMRMR, reducedMRMR, "dt")
-          mrmrAccLR = holdOutPerformance(treducedMRMR, reducedMRMR, "svc")
+          mrmrAccDT = holdOutPerformance(treducedMRMR, reducedMRMR, "dt").toString()
+          mrmrAccLR = holdOutPerformance(treducedMRMR, reducedMRMR, "svc").toString()
           selectedMRMR = mRMRmodel.selectedFeatures.map(_ + 1).mkString(",")
         }
           
         val reducedRC = partialModel.setRedundancyRemoval(true).transform(df)
         val tReducedRC = partialModel.setRedundancyRemoval(true).transform(testDF)
-        val relCAccDT = holdOutPerformance(reducedRC, tReducedRC, "dt") 
-        val relCAccLR = holdOutPerformance(reducedRC, tReducedRC, "svc") 
+        val relCAccDT = holdOutPerformance(reducedRC, tReducedRC, "dt").toString() 
+        val relCAccLR = holdOutPerformance(reducedRC, tReducedRC, "svc").toString() 
         
         val reducedR = partialModel.setRedundancyRemoval(false).transform(df)
         val tReducedR = partialModel.setRedundancyRemoval(false).transform(testDF)
-        val relAccDT = holdOutPerformance(reducedR, tReducedR, "dt") 
-        val relAccLR = holdOutPerformance(reducedR, tReducedR, "svc") 
+        val relAccDT = holdOutPerformance(reducedR, tReducedR, "dt").toString()
+        val relAccLR = holdOutPerformance(reducedR, tReducedR, "svc").toString()
         
-        val accDT = holdOutPerformance(df, testDF, "dt") 
-        val accLR = holdOutPerformance(df, testDF, "lr")        
+        val accDT = holdOutPerformance(df, testDF, "dt").toString()
+        val accLR = holdOutPerformance(df, testDF, "lr").toString()       
     
-        println("Test accuracy for mRMR-" + nfeat + "-DT = " + mrmrAccDT)
-        println("Test accuracy for Reliefc-" + nfeat + "DT = " + relCAccDT)
-        println("Test accuracy for Relief-" + nfeat + "DT = " + relAccDT)
-        println("Test accuracy for baseline-0-DT = " + accDT)
-        println("Test accuracy for mRMR-" + nfeat + "-LR = " + mrmrAccLR)
-        println("Test accuracy for Reliefc-" + nfeat + "LR = " + relCAccLR)
-        println("Test accuracy for Relief-" + nfeat + "LR = " + relAccLR)
-        println("Test accuracy for baseline-0-LR = " + accLR)  
+        println("Test (acc, recall, prec, f1) for mRMR-" + nfeat + "-DT = " + mrmrAccDT)
+        println("Test (acc, recall, prec, f1) for Reliefc-" + nfeat + "DT = " + relCAccDT)
+        println("Test (acc, recall, prec, f1) for Relief-" + nfeat + "DT = " + relAccDT)
+        println("Test (acc, recall, prec, f1) for baseline-0-DT = " + accDT)
+        println("Test (acc, recall, prec, f1) for mRMR-" + nfeat + "-LR = " + mrmrAccLR)
+        println("Test (acc, recall, prec, f1) for Reliefc-" + nfeat + "LR = " + relCAccLR)
+        println("Test (acc, recall, prec, f1) for Relief-" + nfeat + "LR = " + relAccLR)
+        println("Test (acc, recall, prec, f1) for baseline-0-LR = " + accLR)  
       
       }
     }
