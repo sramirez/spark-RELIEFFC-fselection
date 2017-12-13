@@ -87,7 +87,7 @@ object MainMLlibTest {
   var sampling = 100
   var normalize: Boolean = false
   var repartition: Boolean = false
-  var mrmr: Boolean = false
+  var typePred: String = "all"
   
   
   // Case class for criteria/feature
@@ -126,7 +126,7 @@ object MainMLlibTest {
     savePreprocess = params.getOrElse("savePreprocess", "false").toBoolean
     repartition = params.getOrElse("repartition", "false").toBoolean
     normalize = params.getOrElse("normalize", "false").toBoolean
-    mrmr = params.getOrElse("mrmr", "false").toBoolean
+    typePred = params.getOrElse("typePred", "all")
     lowerFeatThreshold = params.getOrElse("lowerFeatThreshold", "3.0").toFloat
     lowerDistanceThreshold = params.getOrElse("lowerDistanceThreshold", "0.8").toFloat
     numHashTables = params.getOrElse("numHashTables", "50").toInt
@@ -320,24 +320,27 @@ object MainMLlibTest {
     println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
     
     var mrmrAcc = 0.0f; var mrmrAccDT = 0.0f; var mrmrAccLR = 0.0f; var selectedMRMR = new String();
-    if(mrmr){      
-      val mRMRmodel = fitMRMR(inputData)
+    if(typePred == "all" || typePred == "onlymrmr"){      
+      val mRMRmodel = fitMRMR(inputData, 100)
       println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
       mrmrAccDT = kCVPerformance(mRMRmodel.transform(inputData), "dt")
       mrmrAccLR = kCVPerformance(mRMRmodel.transform(inputData), "lr")
       selectedMRMR = mRMRmodel.selectedFeatures.map(_ + 1).mkString(",")
     }
-      
-    var relCAcc = 0.0f; var relAcc = 0.0f; var acc = 0.0f;
-    val reducedRC = reliefCollModel.transform(inputData).cache()
-    val reducedR = reliefModel.transform(inputData).cache()
     
-    val relCAccDT = kCVPerformance(reducedRC, "dt")   
-    val relAccDT = kCVPerformance(reducedR, "dt")   
-    val accDT = kCVPerformance(inputData, "dt")   
-    val relCAccLR = kCVPerformance(reducedRC, "lr") 
-    val relAccLR = kCVPerformance(reducedR, "lr") 
-    val accLR = kCVPerformance(inputData, "lr")
+    var relCAccDT = 0.0; var relAccDT = 0.0; var accDT = 0.0; 
+    var relCAccLR = 0.0; var relAccLR = 0.0; var accLR = 0.0;
+    if(typePred == "all" || typePred == "onlyrelief"){      
+      val reducedRC = reliefCollModel.transform(inputData).cache()
+      val reducedR = reliefModel.transform(inputData).cache()
+      
+      val relCAccDT = kCVPerformance(reducedRC, "dt")   
+      val relAccDT = kCVPerformance(reducedR, "dt")   
+      val accDT = kCVPerformance(inputData, "dt")   
+      val relCAccLR = kCVPerformance(reducedRC, "lr") 
+      val relAccLR = kCVPerformance(reducedR, "lr") 
+      val accLR = kCVPerformance(inputData, "lr")
+    }
 
     println("Train accuracy for mRMR (Decision Tree) = " + mrmrAccDT)
     println("Train accuracy for ReliefColl (Decision Tree) = " + relCAccDT)
@@ -644,29 +647,52 @@ object MainMLlibTest {
         Row.fromSeq(Seq(label, standardv))
     }
   }
+
   
-  def fitMRMR(df: Dataset[_]) = {
+  def fitMRMR(df: Dataset[_], nSelect: Int, hardcodedLoad: Boolean = false) = {
     
-    val dataname = pathFile.split("/").last.split("-").head
-    val modelPath = "MRMR-model-" + dataname + "-" + numHashTables + "-" + bucketWidth + "-" +
-        signatureSize + "-" + k + "-" + estimationRatio + "-" + batchSize + "-" + lowerFeatThreshold
-    val selector = new InfoThSelector()
-        .setSelectCriterion("mrmr")
-        .setNPartitions(nPartitions)
-        .setNumTopFeatures(nselect.max)
-        .setFeaturesCol(inputLabel) // this must be a feature vector
-        .setLabelCol(clsLabel)
-        .setOutputCol("selectedFeatures")
+    val dataname = pathFile.split("/").last.split(Array('-','.','_')).head
     var model: InfoThSelectorModel = null
-    try {
-        model = InfoThSelectorModel.load(modelPath)
-    } catch {
-      case t: Throwable => {
-        t.printStackTrace() // TODO: handle error
-        model = selector.fit(df)
-        model.save(modelPath)
+    
+    if(hardcodedLoad){
+      val selected = dataname match {
+        case "ECBDL14" => Array(1,62,17,433,151,176,153,2,10,496,402,3,547,33,316,587,251,364,124,71,476,296,211,117,338,133,431,22,271,116,
+            525,224,384,604,120,471,155,276,7,129,552,254,114,451,165,511,354,544,128,484,378,187,616,130,514,100,16,212,26,44,161,584,53,122,
+            307,327,564,123,396,232,607,516,32,196,166,8,428,339,112,452,171,290,368,113,80,492,167,185,89,125,624,401,18,336,557,27,487,236,157,36)
+        case "kddb" => Array(3284,2281,4189,3893,2417,958,133,1523,1514,2515,11376,2279,6079,87265,6655,755,771,152783,3770,2256,4006,7549,2538,6090,129653,
+            304,49255,4199,3407,4064,665,254774,19777,4924,4039,156,2415,6036,18039,16390,4187,11375,6298,28710,951,6077,216903,32464,3285,6696,3913,4936,7732,
+            2285,1547,125422,24883,254773,2254,797,3427,49333,3302,895,3287,131,216912,4056,3764,16387,6080,1524,6888,4955,2416,1511,4209,158,12097,11612,3310,
+            7558,770,87267,4001,39481,3328,4188,19781,2255,4937,6697,3319,2282,185512,957,16388,6078,6027,4126)
+        case "url" => Array(28,17,6,48,155,270,47,4,155162,70,263,155165,912,216,22,51,155214,355,24,267,5,110,194,909,217,2281,266,59,2401,21,363,18,913,2282,
+            53,3521,54,155168,362,139,2284,90,30,215,910,368,19,2283,155172,356,1736,906,1306,185,3522,271,61,25,11,8197,352,155169,372,274,8200,50,23,1309,39,905,
+            2510,94,10728,1560,2285,8199,1310,705,272,155173,8099,908,367,2288,4582,8198,353,1866,696,915,161,298,1629,275,141,74,4583,914,2286,1032)
+        case "epsilon" => Array(819,1867,650,2,1698,4,1390,1520,101,5,937,316,995,6,148,8,9,1795,469,10,11,12,344,13,1087,1279,14,15,16,756,1401,17,18,21,1052,22,23,790,
+            24,918,25,26,381,27,28,29,830,691,30,31,32,1563,218,33,34,35,36,37,39,1923,40,42,44,45,831,46,47,48,49,696,51,52,53,54,55,1937,56,710,1338,57,58,59,61,62,
+            485,64,543,66,67,68,70,71,72,73,855,74,75,146,76,77)
+      }
+      val oldITSelector = new org.apache.spark.mllib.feature.InfoThSelectorModel(selected.slice(0, nSelect).map(_ - 1))
+      model = new InfoThSelectorModel("mRMR-" + dataname + "-" + nSelect, oldITSelector)
+    } else {
+      val modelPath = "MRMR-model-" + dataname + "-" + numHashTables + "-" + bucketWidth + "-" +
+        signatureSize + "-" + k + "-" + estimationRatio + "-" + batchSize + "-" + lowerFeatThreshold
+      val selector = new InfoThSelector()
+          .setSelectCriterion("mrmr")
+          .setNPartitions(nPartitions)
+          .setNumTopFeatures(nselect.max)
+          .setFeaturesCol(inputLabel) // this must be a feature vector
+          .setLabelCol(clsLabel)
+          .setOutputCol("selectedFeatures")
+      try {
+          model = InfoThSelectorModel.load(modelPath)
+      } catch {
+        case t: Throwable => {
+          t.printStackTrace() // TODO: handle error
+          model = selector.fit(df)
+          model.save(modelPath)
+        }
       }
     }
+    
     model
   }
   
@@ -768,38 +794,43 @@ object MainMLlibTest {
       
       // Print best features according to the RELIEF-F measure
       nselect.reverse.foreach{ nfeat => 
-        val partialModel = model.setReducedSubset(nfeat)
-        val outRC = partialModel.setRedundancyRemoval(true).getSelectedFeatures().mkString("\n")
-        val outR = partialModel.setRedundancyRemoval(false).getSelectedFeatures().mkString("\n")
-        println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
-        println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
         
         var mrmrAccDT = ""; var mrmrAccLR = ""; var selectedMRMR = new String();
-        if(mrmr){    
+        if(typePred == "all" || typePred == "onlymrmr"){        
           val now = System.currentTimeMillis
-          val mRMRmodel = fitMRMR(df)
+          val mRMRmodel = fitMRMR(df, nfeat, hardcodedLoad = true)
           val runtime = (System.currentTimeMillis - now) / 1000
           println("mRMR model training time (in s) = " + runtime)
-          println("\n*** Selected by mRMR: " + mRMRmodel.selectedFeatures.map(_ + 1).mkString(","))
-          val treducedMRMR = mRMRmodel.transform(df)
-          val reducedMRMR = mRMRmodel.transform(testDF)
-          mrmrAccDT = holdOutPerformance(treducedMRMR, reducedMRMR, "dt").toString()
-          mrmrAccLR = holdOutPerformance(treducedMRMR, reducedMRMR, "svc").toString()
           selectedMRMR = mRMRmodel.selectedFeatures.map(_ + 1).mkString(",")
+          println("\n*** Selected by mRMR: " + selectedMRMR)
+          val trReducedMRMR = mRMRmodel.transform(df)
+          val reducedMRMR = mRMRmodel.transform(testDF)
+          mrmrAccDT = holdOutPerformance(trReducedMRMR, reducedMRMR, "dt").toString()
+          mrmrAccLR = holdOutPerformance(trReducedMRMR, reducedMRMR, "svc").toString()          
         }
-          
-        val reducedRC = partialModel.setRedundancyRemoval(true).transform(df)
-        val tReducedRC = partialModel.setRedundancyRemoval(true).transform(testDF)
-        val relCAccDT = holdOutPerformance(reducedRC, tReducedRC, "dt").toString() 
-        val relCAccLR = holdOutPerformance(reducedRC, tReducedRC, "svc").toString() 
         
-        val reducedR = partialModel.setRedundancyRemoval(false).transform(df)
-        val tReducedR = partialModel.setRedundancyRemoval(false).transform(testDF)
-        val relAccDT = holdOutPerformance(reducedR, tReducedR, "dt").toString()
-        val relAccLR = holdOutPerformance(reducedR, tReducedR, "svc").toString()
+        var relCAccDT = ""; var relAccDT = ""
+        var relCAccLR = ""; var relAccLR = ""
+        if(typePred == "all" || typePred == "onlyrelief"){      
+          val partialModel = model.setReducedSubset(nfeat)
+          val outRC = partialModel.setRedundancyRemoval(true).getSelectedFeatures().mkString("\n")
+          val outR = partialModel.setRedundancyRemoval(false).getSelectedFeatures().mkString("\n")
+          println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\n" + outRC)
+          println("\n*** RELIEF selected features ***\nFeature\tScore\n" + outR)
+            
+          val reducedRC = partialModel.setRedundancyRemoval(true).transform(df)
+          val tReducedRC = partialModel.setRedundancyRemoval(true).transform(testDF)
+          relCAccDT = holdOutPerformance(reducedRC, tReducedRC, "dt").toString() 
+          relCAccLR = holdOutPerformance(reducedRC, tReducedRC, "svc").toString() 
+          
+          val reducedR = partialModel.setRedundancyRemoval(false).transform(df)
+          val tReducedR = partialModel.setRedundancyRemoval(false).transform(testDF)
+          relAccDT = holdOutPerformance(reducedR, tReducedR, "dt").toString()
+          relAccLR = holdOutPerformance(reducedR, tReducedR, "svc").toString()
+        }        
         
         val accDT = holdOutPerformance(df, testDF, "dt").toString()
-        val accLR = holdOutPerformance(df, testDF, "lr").toString()       
+        val accLR = holdOutPerformance(df, testDF, "svc").toString() 
     
         println("Test (acc, recall, prec, f1) for mRMR-" + nfeat + "-DT = " + mrmrAccDT)
         println("Test (acc, recall, prec, f1) for Reliefc-" + nfeat + "DT = " + relCAccDT)
