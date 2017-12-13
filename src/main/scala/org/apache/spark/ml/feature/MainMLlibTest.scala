@@ -127,7 +127,7 @@ object MainMLlibTest {
     repartition = params.getOrElse("repartition", "false").toBoolean
     normalize = params.getOrElse("normalize", "false").toBoolean
     typePred = params.getOrElse("typePred", "all")
-    lowerFeatThreshold = params.getOrElse("lowerFeatThreshold", "3.0").toFloat
+    lowerFeatThreshold = params.getOrElse("lowerFeatThreshold", "2.0").toFloat
     lowerDistanceThreshold = params.getOrElse("lowerDistanceThreshold", "0.8").toFloat
     numHashTables = params.getOrElse("numHashTables", "50").toInt
     bucketWidth = params.getOrElse("bucketWidth", "12").toInt
@@ -743,7 +743,9 @@ object MainMLlibTest {
   
   def testFinalSelector(df: Dataset[Row], nElems: Long) {
     
-    val nFeat = df.head().getAs[Vector](inputLabel).size
+    val first = df.head().getAs[Vector](inputLabel)
+    val nFeat = first.size
+    val sparse = first.isInstanceOf[SparseVector]
     println("Total features: " + nFeat)
     
     val selector = new ReliefFRSelector()
@@ -829,7 +831,7 @@ object MainMLlibTest {
           relAccLR = holdOutPerformance(reducedR, tReducedR, "svc").toString()
         }        
         
-        val accDT = holdOutPerformance(df, testDF, "dt").toString()
+        val accDT = if(sparse) holdOutPerformance(df, testDF, "dt").toString() else 0.0
         val accLR = holdOutPerformance(df, testDF, "svc").toString() 
     
         println("Test (acc, recall, prec, f1) for mRMR-" + nfeat + "-DT = " + mrmrAccDT)

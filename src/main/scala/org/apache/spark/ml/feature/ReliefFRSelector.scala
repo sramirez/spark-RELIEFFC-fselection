@@ -282,6 +282,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       
       // Normalize previous results and return the best features
       results(i) = rawWeights.cache() 
+      val red = results(i).first()._2._2
+      println("First redundancy: " + red.toString)
       
       val localR = results(i).collect()
       if(results(i).count > 0){ // call the action required to persist data
@@ -319,7 +321,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val normWeights = finalWeights.mapValues{ case(w, joint) => (w - minRelief) / (maxRelief - minRelief) -> joint}
         
     // normalized redundancy
-    val rddFinalWeights = computeRedudancy(normWeights, marginalVector, total, nFeat, sparse).cache()
+    val rddFinalWeights = computeRedudancy(normWeights, marginalVector, total, nFeat, weight, sparse).cache()
     val (reliefCol, relief) = selectFeatures(rddFinalWeights, nFeat)
     val outRC = reliefCol.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
     val outR = relief.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
@@ -642,22 +644,27 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   }
   
   private def computeRedudancy(weights: RDD[(Int, (Float, Vector))], rawMarginal: BV[Double], 
-      total: Long, nFeat: Int, sparse: Boolean) = {
+      total: Long, nFeat: Int, weight: Double, sparse: Boolean) = {
     // Now compute redundancy based on collisions and normalize it
     val factor = if($(discreteData) || sparse) Double.MinPositiveValue else 1.0
+    println("Marginal information (before): " + Vectors.fromBreeze(rawMarginal).toString())
     val marginal = rawMarginal.mapActiveValues(_ /  (total * factor))
+    println("Marginal information: " + Vectors.fromBreeze(marginal).toString())
     
-    val jointTotal = total * factor * (1 - $(estimationRatio) * $(batchSize)) // we omit the first batch
+    val jointTotal = total * factor * (1 - $(estimationRatio) * weight) // we omit the first batch
     // Apply the factor and the entropy formula
     val applyEntropy = (i1: Int, i2: Int, value: Double) => {
       val jprob = value / jointTotal
       val red = jprob * log2(jprob / (marginal(i1) * marginal(i2)))  
       if(!red.isNaN()) red else 0
     }
+    println("Joint total: " + jointTotal)
+    println("First weight: " + weights.first()._2._2.toString())
     
     val entropyWeights = weights.map{ case (i1,(w, joint)) => 
       val res = joint.asBreeze match {
-        case sv: BSV[Double] => 
+   
+      case sv: BSV[Double] => 
           sv.mapActivePairs{case (i2, value) => applyEntropy(i1, i2, value)}
         case dv: BDV[Double] => 
           dv.mapActivePairs{case (i2, value) => applyEntropy(i1, i2, value)}
@@ -747,9 +754,9 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       }
     }
     override def toString() = {
-      "%.4f".format(score) + "\t" +
-      "%.4f".format(relevance) + "\t" +
-      "%.4f".format(redundance)
+      "%.8f".format(score) + "\t" +
+      "%.8f".format(relevance) + "\t" +
+      "%.8f".format(redundance)
     }
     def init(relevance: Float): FeatureScore = {
       this.relevance = relevance
