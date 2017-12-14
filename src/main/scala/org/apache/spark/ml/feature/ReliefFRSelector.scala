@@ -246,14 +246,24 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val sampledSize = math.floor($(estimationRatio) * nElems)
     val maxWeight = Integer.MAX_VALUE / 8 / (nFeat + 2) / sampledSize // nfeat + id + label + extra pad
     val weight = math.min($(batchSize), maxWeight)
-    val weights = Array.fill((1 / weight).toInt)(weight)
+    val nbatches = (1 / weight).toInt
+    logInfo("# of elements: " + nElems)
+    logInfo("# of features: " + nFeat)        
+    logInfo("Sparse data: " + sparse)
+    logInfo("Computed lower threshold for features: " + lowerFeat)
+    logInfo("Class distribution: " + priorClass.toString())
+    logInfo("Sampled size: " + sampledSize)
+    logInfo("Sampling percentage per batch: " + weight)
+    logInfo("Number of batches: " + nbatches)
+    
+    // Split into batches
+    val weights = Array.fill(nbatches)(weight)
     val batches = modelDataset.sample(false, $(estimationRatio), $(seed)).randomSplit(weights, $(seed))
+    var topFeatures: Set[Int] = Set.empty
     var featureWeights: BV[Float] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
     var marginalVector: BV[Double] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
-    var topFeatures: Set[Int] = Set.empty
     var total = 0L // total number of comparisons at the collision level
     val results: Array[RDD[(Int, (Float, Vector))]] = Array.fill(batches.size)(sc.emptyRDD)
-    logInfo("Number of batches to be computed in RELIEF: " + results.size)
         
     for(i <- 0 until batches.size) {
       val start = System.currentTimeMillis
@@ -262,7 +272,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       val query = if ($(numHashTables) > 0) idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)), col(hashOutputCol)) else
             idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)))
       val lquery = query.collect()
-      println("size: " + lquery.length)
+      logInfo("# of query elements: " + lquery.length)
       logInfo("Estimated size for broadcasted query: " + SizeEstimator.estimate(lquery)) 
       val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(lquery)
           
@@ -281,10 +291,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           topFeatures, priorClass, nFeat, nElems)
       
       // Normalize previous results and return the best features
-      results(i) = rawWeights.cache() 
-      val red = results(i).first()._2._2
-      println("First redundancy: " + red.toString)
-      
+      results(i) = rawWeights.cache()      
       val localR = results(i).collect()
       if(results(i).count > 0){ // call the action required to persist data
         val normalized = normalizeRankingDF(results(i).mapValues(_._1))
@@ -647,19 +654,15 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       total: Long, nFeat: Int, weight: Double, sparse: Boolean) = {
     // Now compute redundancy based on collisions and normalize it
     val factor = if($(discreteData) || sparse) Double.MinPositiveValue else 1.0
-    println("Marginal information (before): " + Vectors.fromBreeze(rawMarginal).toString())
-    val marginal = rawMarginal.mapActiveValues(_ /  (total * factor))
-    println("Marginal information: " + Vectors.fromBreeze(marginal).toString())
-    
+    val marginal = rawMarginal.mapActiveValues(_ /  (total * factor))   
     val jointTotal = total * factor * (1 - $(estimationRatio) * weight) // we omit the first batch
+    
     // Apply the factor and the entropy formula
     val applyEntropy = (i1: Int, i2: Int, value: Double) => {
       val jprob = value / jointTotal
       val red = jprob * log2(jprob / (marginal(i1) * marginal(i2)))  
       if(!red.isNaN()) red else 0
     }
-    println("Joint total: " + jointTotal)
-    println("First weight: " + weights.first()._2._2.toString())
     
     val entropyWeights = weights.map{ case (i1,(w, joint)) => 
       val res = joint.asBreeze match {
