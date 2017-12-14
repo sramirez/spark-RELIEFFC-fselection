@@ -670,8 +670,8 @@ object MainMLlibTest {
             24,918,25,26,381,27,28,29,830,691,30,31,32,1563,218,33,34,35,36,37,39,1923,40,42,44,45,831,46,47,48,49,696,51,52,53,54,55,1937,56,710,1338,57,58,59,61,62,
             485,64,543,66,67,68,70,71,72,73,855,74,75,146,76,77)
       }
-      val oldITSelector = new org.apache.spark.mllib.feature.InfoThSelectorModel(selected.slice(0, nSelect).map(_ - 1))
-      model = new InfoThSelectorModel("mRMR-" + dataname + "-" + nSelect, oldITSelector)
+      val oldITSelector = new org.apache.spark.mllib.feature.InfoThSelectorModel(selected.slice(0, nSelect).map(_ - 1).sorted)
+      model = new InfoThSelectorModel("mRMR-" + dataname + "-" + nSelect, oldITSelector).setOutputCol("selectedFeatures")
     } else {
       val modelPath = "MRMR-model-" + dataname + "-" + numHashTables + "-" + bucketWidth + "-" +
         signatureSize + "-" + k + "-" + estimationRatio + "-" + batchSize + "-" + lowerFeatThreshold
@@ -831,7 +831,7 @@ object MainMLlibTest {
           relAccLR = holdOutPerformance(reducedR, tReducedR, "svc").toString()
         }        
         
-        val accDT = if(sparse) holdOutPerformance(df, testDF, "dt").toString() else 0.0
+        val accDT = if(sparse) holdOutPerformance(df, testDF, "dt").toString() else "0.0"
         val accLR = holdOutPerformance(df, testDF, "svc").toString() 
     
         println("Test (acc, recall, prec, f1) for mRMR-" + nfeat + "-DT = " + mrmrAccDT)
