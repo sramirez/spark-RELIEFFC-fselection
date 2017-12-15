@@ -831,7 +831,7 @@ object MainMLlibTest {
           relAccLR = holdOutPerformance(reducedR, tReducedR, "svc").toString()
         }        
         
-        val accDT = if(sparse) holdOutPerformance(df, testDF, "dt").toString() else "0.0"
+        val accDT = if(!sparse) holdOutPerformance(df, testDF, "dt").toString() else "0.0"
         val accLR = holdOutPerformance(df, testDF, "svc").toString() 
     
         println("Test (acc, recall, prec, f1) for mRMR-" + nfeat + "-DT = " + mrmrAccDT)
