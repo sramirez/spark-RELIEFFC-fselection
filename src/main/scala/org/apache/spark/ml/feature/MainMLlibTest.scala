@@ -807,7 +807,7 @@ object MainMLlibTest {
           println("\n*** Selected by mRMR: " + selectedMRMR)
           val trReducedMRMR = mRMRmodel.transform(df)
           val reducedMRMR = mRMRmodel.transform(testDF)
-          mrmrAccDT = holdOutPerformance(trReducedMRMR, reducedMRMR, "dt").toString()
+          if(!sparse) mrmrAccDT = holdOutPerformance(trReducedMRMR, reducedMRMR, "dt").toString()
           mrmrAccLR = holdOutPerformance(trReducedMRMR, reducedMRMR, "svc").toString()          
         }
         
@@ -822,12 +822,12 @@ object MainMLlibTest {
             
           val reducedRC = partialModel.setRedundancyRemoval(true).transform(df)
           val tReducedRC = partialModel.setRedundancyRemoval(true).transform(testDF)
-          relCAccDT = holdOutPerformance(reducedRC, tReducedRC, "dt").toString() 
+          if(!sparse) relCAccDT = holdOutPerformance(reducedRC, tReducedRC, "dt").toString() 
           relCAccLR = holdOutPerformance(reducedRC, tReducedRC, "svc").toString() 
           
           val reducedR = partialModel.setRedundancyRemoval(false).transform(df)
           val tReducedR = partialModel.setRedundancyRemoval(false).transform(testDF)
-          relAccDT = holdOutPerformance(reducedR, tReducedR, "dt").toString()
+          if(!sparse) relAccDT = holdOutPerformance(reducedR, tReducedR, "dt").toString()
           relAccLR = holdOutPerformance(reducedR, tReducedR, "svc").toString()
         }        
         
