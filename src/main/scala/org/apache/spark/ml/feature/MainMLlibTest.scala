@@ -47,6 +47,8 @@ import org.apache.spark.mllib.classification.SVMWithSGD
 import org.apache.spark.ml.classification.LinearSVC
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.ml.evaluation.BinaryClassificationEvaluator
+import org.apache.spark.ml.stat.Correlation
+import org.apache.spark.ml.linalg.Matrix
 
 
 
@@ -153,6 +155,8 @@ object MainMLlibTest {
       this.testLSHPerformance(df, nelems)
     } else if(mode == "final") {
       testFinalSelector(df, nelems)
+    } else if(mode == "corr") {
+      computeCorrelation(df, nelems)
     } else {
       doRELIEFComparison(df)
     }
@@ -738,6 +742,21 @@ object MainMLlibTest {
     println("Average error ratio (distance): " + sumer / keys.size)
     println("Average maximum distance: " + sumMax / keys.size)
     println("Total Maximum distance: " + maxd)
+    
+  }
+  
+  
+  def computeCorrelation(df: Dataset[Row], nElems: Long) {
+    
+    val first = df.head().getAs[Vector](inputLabel)
+    val nFeat = first.size
+    val sparse = first.isInstanceOf[SparseVector]
+    println("Total features: " + nFeat)
+    val Row(coeff1: Matrix) = Correlation.corr(df, inputLabel).head
+    println("Pearson correlation matrix:\n" + coeff1.toString)
+    
+    val Row(coeff2: Matrix) = Correlation.corr(df, inputLabel, "spearman").head
+    println("Spearman correlation matrix:\n" + coeff2.toString)
     
   }
   
