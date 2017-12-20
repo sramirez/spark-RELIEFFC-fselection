@@ -745,17 +745,39 @@ object MainMLlibTest {
     
   }
   
+  private def matrixToFile(sc: SparkContext, mat: Matrix, file: String){
+    
+    println("Max correlation: " + mat.asBreeze.max)
+    println("Min correlation: " + mat.asBreeze.min)
+    
+    val lines: List[String] = mat
+        .transpose  // Transpose since .toArray is column major
+        .toArray
+        .grouped(mat.numCols)
+        .toList
+        .map(line => line.mkString(","))
+
+    sc.parallelize(lines)
+        .repartition(1)
+        .saveAsTextFile(file) 
+  }
+  
   
   def computeCorrelation(df: Dataset[Row], nElems: Long) {
     
     val first = df.head().getAs[Vector](inputLabel)
     val nFeat = first.size
     val sparse = first.isInstanceOf[SparseVector]
+    val sc = df.sparkSession.sparkContext
+    val dataname = pathFile.split("/").last.split(Array('-','.','_')).head
+    
     println("Total features: " + nFeat)
     val Row(coeff1: Matrix) = Correlation.corr(df, inputLabel).head
+    matrixToFile(sc, coeff1, "coeff1-" + dataname)
     println("Pearson correlation matrix:\n" + coeff1.toString)
     
     val Row(coeff2: Matrix) = Correlation.corr(df, inputLabel, "spearman").head
+    matrixToFile(sc, coeff2, "coeff2-" + dataname)
     println("Spearman correlation matrix:\n" + coeff2.toString)
     
   }
