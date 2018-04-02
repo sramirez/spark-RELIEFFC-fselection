@@ -67,62 +67,7 @@ private[feature] trait ReliefFRSelectorParams extends Params
    *
    * @group param
    */
-  
-  /**
-   * Param for the number of hash tables used in LSH OR-amplification.
-   *
-   * LSH OR-amplification can be used to reduce the false negative rate. Higher values for this
-   * param lead to a reduced false negative rate, at the expense of added computational complexity.
-   * @group param
-   */
-  final val numHashTables: IntParam = new IntParam(this, "numHashTables", "number of hash " +
-    "tables, where increasing number of hash tables lowers the false negative rate, and " +
-    "decreasing it improves the running performance", ParamValidators.gtEq(0))
-
-  /** @group getParam */
-  final def getNumHashTables: Int = $(numHashTables)
-  setDefault(numHashTables -> 1)
-  
-    /**
-   * Param for the size of signatures built inside the hash tables.
-   *
-   * Higher values for this param lead to a reduced false negative rate, 
-   * at the expense of added computational complexity.
-   * @group param
-   */
-  final val signatureSize: IntParam = new IntParam(this, "signatureSize", "signature size or" +
-    "number of random projections, where increasing size means lowers the false negative rate, and " +
-    "decreasing it improves the running performance", ParamValidators.gt(0))
-
-  /** @group getParam */
-  final def getSignatureSize: Int = $(signatureSize)
-  setDefault(signatureSize -> 16)
-  
-  /**
-   * The length of each hash bucket, a larger bucket lowers the false negative rate. The number of
-   * buckets will be `(max L2 norm of input vectors) / bucketLength`.
-   *
-   *
-   * If input vectors are normalized, 1-10 times of pow(numRecords, -1/inputDim) would be a
-   * reasonable value
-   * @group param
-   */
-  val bucketLength: DoubleParam = new DoubleParam(this, "bucketLength",
-    "the length of each hash bucket, a larger bucket lowers the false negative rate.",
-    ParamValidators.gt(0))
-
-  /** @group getParam */
-  final def getBucketLength: Double = $(bucketLength)  
-  setDefault(bucketLength -> 4)
-
-  final val sparseSpeedup: DoubleParam = new DoubleParam(this, "sparseSpeedup", "", ParamValidators.gtEq(0))
-
-  /** @group getParam */
-  final def getSparseSpeedup: Double = $(sparseSpeedup)
-
-  setDefault(sparseSpeedup -> 0)
-  
-  
+    
   /**
    * Number of features that selector will select (ordered by statistic value descending). If the
    * number of features is < numTopFeatures, then this will select all features. The default value
@@ -177,12 +122,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   def setInputCol(value: String): this.type = set(inputCol, value)
   def setSeed(value: Long): this.type = set(seed, value)
   def setDiscreteData(value: Boolean): this.type = set(discreteData, value)
-  /** @group LSH params */
-  def setNumHashTables(value: Int): this.type = set(numHashTables, value)
-  def setSignatureSize(value: Int): this.type = set(signatureSize, value)  
-  def setBucketLength(value: Double): this.type = set(bucketLength, value)
-  def setQueryStep(value: Int): this.type = set(queryStep, value) 
-  def setSparseSpeedup(value: Double): this.type = set(sparseSpeedup, value)
   /** @group RELIEF params */
   def setNumTopFeatures(value: Int): this.type = set(numTopFeatures, value)
   def setNumNeighbors(value: Int): this.type = set(numNeighbors, value)
@@ -206,29 +145,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     // Get Hash Value of the key 
     val hashOutputCol = "hashRELIEF_" + System.currentTimeMillis()
-    val modelDataset: DataFrame = if($(numHashTables) > 0){
-      val now = System.currentTimeMillis
-      val brp = new BucketedRandomLSH()
-        .setInputCol($(inputCol))
-        .setOutputCol(hashOutputCol)
-        .setSparseSpeedup($(sparseSpeedup))
-        .setNumHashTables($(numHashTables))
-        .setBucketLength($(bucketLength))
-        .setSignatureSize($(signatureSize))
-        .setSeed($(seed))
-      val LSHmodel = brp.fit(dataset)
-      val hashRuntime = (System.currentTimeMillis - now) / 1000
-      logInfo("Hash model trained in " + hashRuntime + "s")
-      
-      // Generate hash code for the complete dataset
-      if (!dataset.columns.contains(hashOutputCol)) {
-          LSHmodel.transform(dataset).cache()
-        } else {
-          dataset.toDF()
-        }  
-    } else {
-      dataset.toDF()
-    }
+    val modelDataset: DataFrame = dataset.toDF()
     
     // Get some basic information about the dataset
     val sc = dataset.sparkSession.sparkContext
@@ -245,7 +162,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             
     val sample = modelDataset.sample(false, $(estimationRatio), $(seed))
     val sampledSize = sample.count()
-    val maxWeight = Integer.MAX_VALUE / 8 / (nFeat + 2) / sampledSize // nfeat + id + label + extra pad
+    val maxWeight = if(!sparse) Integer.MAX_VALUE / 8 / (nFeat + 2) / sampledSize else $(batchSize) // nfeat + id + label + extra pad
     val weight = math.min($(batchSize), maxWeight)
     val nbatches = (1 / weight).toInt
     logInfo("# of elements: " + nElems)
@@ -270,8 +187,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       val start = System.currentTimeMillis
       // Index query objects and compute the table that indicates where are located its neighbors
       val idxModelQuery = batches(i).withColumn("UniqueID", monotonically_increasing_id).cache()
-      val query = if ($(numHashTables) > 0) idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)), col(hashOutputCol)) else
-            idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)))
+      val query = idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)))
       val lquery = query.collect()
       logInfo("# of query elements: " + lquery.length)
       logInfo("Estimated size for broadcasted query: " + SizeEstimator.estimate(lquery)) 
@@ -356,8 +272,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     case class Localization(part: Int, index: Int)
     val sc = modelDataset.sparkSession.sparkContext
     val qstep = $(queryStep)
-    val lshOn = $(numHashTables) > 0
-    val input = if(lshOn) modelDataset.select($(inputCol), hashCol) else modelDataset.select($(inputCol))
+    val input = modelDataset.select($(inputCol))
     val icol = $(inputCol)
     
     val neighbors = input.rdd.mapPartitionsWithIndex { 
@@ -370,23 +285,11 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           var i = 0
           // First iterate over the local elements, and then over the sampled set (also called query set).
           while(it.hasNext) {
-            if(lshOn) {
-              val Row(inputNeig: Vector, hashNeig: WrappedArray[Vector]) = it.next
+            val inputNeig = it.next.getAs[Vector](icol)
               (0 until query.size).foreach { j => 
-                 val Row(_, inputQuery: Vector, _, hashQuery: WrappedArray[Vector]) = query(j) 
-                 val hdist = BucketedRandomLSH.hashThresholdedDistance(hashQuery.array, hashNeig.array, qstep)
-                 if(hdist < Double.PositiveInfinity) {
-                   val distance = BucketedRandomLSH.keyDistance(inputQuery, inputNeig).toFloat
-                   neighbors(j)._2 += distance -> Localization(pindex.toShort, i)
-                 }    
-               }
-            } else {
-              val inputNeig = it.next.getAs[Vector](icol)
-              (0 until query.size).foreach { j => 
-                 val distance = BucketedRandomLSH.keyDistance(query(j).getAs[Vector](icol), inputNeig).toFloat
+                 val distance = Math.sqrt(Vectors.sqdist(query(j).getAs[Vector](icol), inputNeig)).toFloat
                  neighbors(j)._2 += distance -> Localization(pindex.toShort, i)    
                }
-            }
             i += 1              
           }            
           neighbors.toIterator

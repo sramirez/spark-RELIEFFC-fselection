@@ -151,9 +151,7 @@ object MainMLlibTest {
     println("# of examples readed and processed: " + nelems)
        
     
-    if(mode == "test-lsh"){
-      this.testLSHPerformance(df, nelems)
-    } else if(mode == "final") {
+    if(mode == "final") {
       testFinalSelector(df, nelems)
     } else if(mode == "corr") {
       computeCorrelation(df, nelems)
@@ -700,51 +698,6 @@ object MainMLlibTest {
     model
   }
   
-  def testLSHPerformance(df: Dataset[_], nelems: Long) {
-    
-    val nFeat = df.select(inputLabel).head().getAs[Vector](0).size
-    val kfold = 3
-    
-    val brp = new BucketedRandomLSH()
-      .setNumHashTables(numHashTables)
-      .setInputCol(inputLabel)
-      .setOutputCol("hashCol")
-      .setBucketLength(bucketWidth)
-      .setSignatureSize(signatureSize)
-      .setSparseSpeedup(sparseSpeedup)
-      .setSeed(seed)
-   var model = brp.fit(df)
-      
-      // Sample only some elements to test
-    val samplingRate = sampling * kfold / nelems.toDouble // k-fold cross validation, k = 10
-    val keys = df.select(inputLabel).sample(false, samplingRate, seed).collect()
-    println("Number of examples used in estimation: " + keys.length)
-    
-    var sumer = 0.0; var sump = 0.0; var sumr = 0.0; var red = 0L; var sumtime = 0.0; 
-    var sumMax = 0.0; var maxd = 0.0; var cont = 0
-    keys.foreach { case Row(key: Vector) =>  
-      val (errorRatio, precision, recall, redundancy, time) = LSHTest.calculateApproxNearestNeighbors(
-          model, df, key, k, "multi", "distCol", nelems) 
-      sump += precision; sumr += recall; sumtime += time; sumer += errorRatio
-      cont += 1
-      if(cont % kfold == 0)
-        model = brp.fit(df)
-      println("# instances completed: " + cont)
-    }
-    
-    println("Average precision: " + sump / keys.size)
-    println("Average recall: " + sumr / keys.size)
-    println("Average selectivity: " + red / keys.size)
-    println("Average runtime (in s): " + sumtime / keys.size)
-    println("Number of hash tables: " + numHashTables)
-    println("Signature size: " + signatureSize)
-    println("Bucket width: " + bucketWidth)
-    println("Average error ratio (distance): " + sumer / keys.size)
-    println("Average maximum distance: " + sumMax / keys.size)
-    println("Total Maximum distance: " + maxd)
-    
-  }
-  
   private def matrixToFile(sc: SparkContext, mat: Matrix, file: String){
     
     println("Max correlation: " + mat.asBreeze.max)
@@ -793,10 +746,6 @@ object MainMLlibTest {
       .setInputCol(inputLabel)
       .setOutputCol("selectedFeatures")
       .setLabelCol(clsLabel)
-      .setNumHashTables(numHashTables)
-      .setBucketLength(bucketWidth)
-      .setSignatureSize(signatureSize)
-      .setSparseSpeedup(sparseSpeedup)
       .setSeed(seed)
       .setNumNeighbors(k)
       .setNumTopFeatures(nselect.max)
@@ -804,7 +753,6 @@ object MainMLlibTest {
       .setBatchSize(batchSize)
       .setLowerFeatureThreshold(lowerFeatThreshold)
       .setLowerDistanceThreshold(lowerDistanceThreshold)
-      .setQueryStep(queryStep)
       .setDiscreteData(!continuous)
     
     val now = System.currentTimeMillis
