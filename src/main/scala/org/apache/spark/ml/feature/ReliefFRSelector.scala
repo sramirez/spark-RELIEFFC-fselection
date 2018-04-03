@@ -18,6 +18,7 @@
 package org.apache.spark.ml.feature
 
 import org.apache.hadoop.fs.Path
+
 import org.apache.spark.annotation.{ Since, Experimental }
 import org.apache.spark.ml._
 import org.apache.spark.ml.attribute.{ AttributeGroup, _ }
@@ -25,6 +26,11 @@ import org.apache.spark.ml.linalg.{ Vector, VectorUDT }
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.linalg.Vectors
+import org.apache.spark.ml.util.MatrixAccumulator
+import org.apache.spark.ml.util.VectorAccumulator
+import org.apache.spark.ml.util.BoundedPriorityQueue
+import org.apache.spark.ml.linalg.SparseVector
 import org.apache.spark.mllib.feature
 import org.apache.spark.mllib.linalg.{ Vectors => OldVectors }
 import org.apache.spark.mllib.regression.{ LabeledPoint => OldLabeledPoint }
@@ -33,27 +39,28 @@ import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{ DoubleType, StructField, StructType }
 import org.apache.spark.broadcast.Broadcast
-import scala.collection.mutable.Queue
-import breeze.linalg.Axis
 import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.sql.types.LongType
 import org.apache.spark.sql.types.DataTypes
-import scala.collection.mutable.WrappedArray
 import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.types.FloatType
+import org.apache.spark.util.SizeEstimator
+
+
+import scala.collection.mutable.WrappedArray
+import scala.collection.mutable.Queue
+import scala.collection.mutable.HashMap
+import scala.collection.immutable.HashSet
+import scala.collection.mutable.ArrayBuffer
+import scala.collection.immutable.TreeMap
+
+import breeze.linalg.Axis
 import breeze.linalg.VectorBuilder
 import breeze.linalg.CSCMatrix
-import org.apache.spark.ml.linalg.SparseVector
-import scala.collection.mutable.HashMap
 import breeze.linalg.{Matrix => BM, Vector => BV, DenseMatrix => BDM, DenseVector => BDV, SparseVector => BSV}
 import breeze.generic.UFunc
 import breeze.generic.MappingUFunc
 import breeze.linalg.support._
-import scala.collection.immutable.HashSet
-import org.apache.spark.util.SizeEstimator
-import scala.collection.mutable.ArrayBuffer
-import scala.collection.immutable.TreeMap
-import org.apache.spark.ml.linalg.Vectors
 
 /**
  * Params for [[ReliefFRSelector]] and [[ReliefFRSelectorModel]].

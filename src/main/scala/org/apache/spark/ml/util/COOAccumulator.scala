@@ -1,4 +1,4 @@
-package org.apache.spark.ml.feature
+package org.apache.spark.ml.util
 
 
 import breeze.linalg._

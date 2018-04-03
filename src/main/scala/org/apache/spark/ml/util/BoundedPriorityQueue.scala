@@ -1,10 +1,10 @@
-package org.apache.spark.ml.feature
+package org.apache.spark.ml.util
 
 import java.io.Serializable
 import java.util.{ PriorityQueue => JPriorityQueue }
-
 import scala.collection.JavaConverters._
 import scala.collection.generic.Growable
+import java.util.{PriorityQueue => JPriorityQueue}
 
 /**
  * Copy of org.apache.spark.util.BoundedPriorityQueue which is private for..., eh reasons.
