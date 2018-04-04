@@ -69,8 +69,7 @@ private[feature] trait ReliefFRSelectorParams extends Params
     with HasInputCol with HasOutputCol with HasLabelCol with HasSeed {
 
   /**
-   * Relief with redundancy removal criterion used to rank the features.
-   * Relief relies on LSH to perform efficient nearest neighbor searches.
+   * Relief + redundancy removal based on co-ocurrences. Both are used to rank features.
    *
    * @group param
    */
@@ -84,31 +83,77 @@ private[feature] trait ReliefFRSelectorParams extends Params
    */
   final val numTopFeatures = new IntParam(this, "numTopFeatures",
     "Number of features that selector will select, ordered by statistics value descending. If the" +
-      " number of features is < numTopFeatures, then this will select all features.",
+      " number of features is < numTopFeatures, then the entire set of input features will be selected.",
     ParamValidators.gtEq(1))
   setDefault(numTopFeatures -> 10)
   
-  final val numNeighbors = new IntParam(this, "numNeighbors", "",
-    ParamValidators.gtEq(1))
+  /**
+   * Number of neighbors used in RELIEF-F to estimate separability among features.
+   * A more crowded neighborhood implies more accurate estimations, but a more costly process.
+   * Note: The algorithm will select N-neighbors for each class so the real number of neighbors computed
+   * will depend on the amount of output labels. The default value of numNeighbors is 10.
+   *
+   * @group param
+   */
+  final val numNeighbors = new IntParam(this, "numNeighbors", 
+      "Number of neighbors used in RELIEF-F to estimate separability among features.",
+      ParamValidators.gtEq(1))
   setDefault(numNeighbors -> 10)
   
+  /**
+   * Subset of samples that will serve to estimate weights. Notice that neighborhoods will be computed
+   * regarding the entire dataset. Complexity order will thus shift from quadratic to one based on
+   * estimationRate *  |dataset|. The default value of estimationRatio is 0.25.
+   * 
+   * 
+   * @group param
+   */
   final val estimationRatio: DoubleParam = new DoubleParam(this, "estimationRatio", "", ParamValidators.inRange(0,1))
   setDefault(estimationRatio -> 0.25)
   
+  /**
+   * Previous sample is split into several batches to reduce even further derived complexity. In addition,
+   * ranking from previous steps will serve to select which features will be involved in redundancy computations.
+   * The default value of estimationRatio is 0.1.
+   * 
+   * @group param
+   */
   final val batchSize: DoubleParam = new DoubleParam(this, "batchSize", "", ParamValidators.inRange(0,1))
   setDefault(batchSize -> 0.1)
   
+  /**
+   * 
+   * 
+   * @group param 
+   */
   final val queryStep: IntParam = new IntParam(this, "queryStep", "", ParamValidators.gtEq(1))
   setDefault(queryStep -> 2)  
   
+  
+  /**
+   * Rate of features (with respect to the selection set) that will be involved in redundancy computations. 
+   * Low values close to 1.0 imply quicker computations but weaker estimations, 
+   * whereas high values imply the opposite scenario. 
+   * The default value of lowerFeatureThreshold is 3.0 (three times the selection rate).
+   *
+   * @group param
+   */
   final val lowerFeatureThreshold: DoubleParam = new DoubleParam(this, "lowerFeatureThreshold", "", ParamValidators.gtEq(1))
   setDefault(lowerFeatureThreshold -> 3.0)
   
   final val lowerDistanceThreshold: DoubleParam = new DoubleParam(this, "lowerDistanceThreshold", "", ParamValidators.inRange(0,1))
   setDefault(lowerDistanceThreshold -> 0.8)
   
-  final val redundancyRemoval: BooleanParam = new BooleanParam(this, "redundancyRemoval", "")
-  setDefault(redundancyRemoval -> true)
+  /**
+   * If redundancy removal technique is activated or only standard RELIEF-F is performed. 
+   * Redundancy estimation is based on zero-distances computed in the RELIEF-F step. 
+   * If two features share similar values (distance = 0), redundancy score will increase.
+   * The default value of redundancyRemoval is false.
+   *
+   * @group param
+   */
+  final val redundancyRemoval: BooleanParam = new BooleanParam(this, "redundancyRemoval", "If redundancy removal technique is activated or only standard RELIEF-F is performed.")
+  setDefault(redundancyRemoval -> false)
   
   final val discreteData: BooleanParam = new BooleanParam(this, "discreteData", "")
   setDefault(discreteData -> false)
@@ -117,7 +162,7 @@ private[feature] trait ReliefFRSelectorParams extends Params
 
 /**
  * :: Experimental ::
- * Relief feature selection, which relies on distance measurements among neighbors to weight features.
+ * Relief feature weighting method. It relies on distance measurements in neighborhoods to estimate feature importance.
  */
 @Experimental
 final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: String = Identifiable.randomUID("ReliefFRSelector"))
@@ -145,13 +190,12 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     SchemaUtils.appendColumn(schema, $(outputCol), new VectorUDT)
   }
   
-@Since("2.0.0")
+  @Since("2.0.0")
   override def fit(dataset: Dataset[_]): ReliefFRSelectorModel = {
     
     transformSchema(dataset.schema, logging = true)
     
     // Get Hash Value of the key 
-    val hashOutputCol = "hashRELIEF_" + System.currentTimeMillis()
     val modelDataset: DataFrame = dataset.toDF()
     
     // Get some basic information about the dataset
@@ -159,19 +203,26 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val spark = dataset.sparkSession.sqlContext
     val nElems = modelDataset.count() // needed to persist the training set
     val first = modelDataset.head().getAs[Vector]($(inputCol))
-    val sparse = first.isInstanceOf[SparseVector]
+    val sparse = first.isInstanceOf[SparseVector] // data is sparse or dense
     val nFeat = first.size
-    val lowerFeat = math.max($(numTopFeatures), math.round($(lowerFeatureThreshold).toFloat * $(numTopFeatures))) // 0 is the min, 0.5 the median
+    val lowerFeat = math.max($(numTopFeatures), 
+        math.round($(lowerFeatureThreshold).toFloat * $(numTopFeatures)))
+        // Top-N relevant features used to estimate redundancy (default: 3 times the number of features selected)
+    // Prior prob. for each output label
     val priorClass = modelDataset.select($(labelCol)).rdd.map{ case Row(label: Double) => label }
         .countByValue()
         .mapValues(v => (v.toDouble / nElems).toFloat)
         .map(identity).toMap
-            
+    
+    // Sample estimation rate
     val sample = modelDataset.sample(false, $(estimationRatio), $(seed))
     val sampledSize = sample.count()
-    val maxWeight = if(!sparse) Integer.MAX_VALUE / 8 / (nFeat + 2) / sampledSize else $(batchSize) // nfeat + id + label + extra pad
+    val maxWeight = if(!sparse) Integer.MAX_VALUE / 8 / (nFeat + 2) / sampledSize else $(batchSize) 
+    // In order to avoid batches broadcasted exceed the maximum set to Integer.MAX_VALUE (about 2,3 GB)
     val weight = math.min($(batchSize), maxWeight)
     val nbatches = (1 / weight).toInt
+    
+    // Display basic information
     logInfo("# of elements: " + nElems)
     logInfo("# of features: " + nFeat)        
     logInfo("Sparse data: " + sparse)
@@ -187,25 +238,29 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     var topFeatures: Set[Int] = Set.empty
     var featureWeights: BV[Float] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
     var marginalVector: BV[Double] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
-    var total = 0L // total number of comparisons at the collision level
+    var total = 0L // total number of comparisons already made at the redundancy level
     val results: Array[RDD[(Int, (Float, Vector))]] = Array.fill(batches.size)(sc.emptyRDD)
         
     for(i <- 0 until batches.size) {
       val start = System.currentTimeMillis
-      // Index query objects and compute the table that indicates where are located its neighbors
-      val idxModelQuery = batches(i).withColumn("UniqueID", monotonically_increasing_id).cache()
-      val query = idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)))
-      val lquery = query.collect()
+      // Index query objects and compute the table that indicates where each neighbor is located
+      val idxModelQuery: Dataset[Row] = batches(i).withColumn("UniqueID", monotonically_increasing_id).cache()
+      val query: Dataset[Row] = idxModelQuery.select(col("UniqueID"), col($(inputCol)), col($(labelCol)))
+      val lquery: Array[Row] = query.collect()
+      
       logInfo("# of query elements: " + lquery.length)
       logInfo("Estimated size for broadcasted query: " + SizeEstimator.estimate(lquery)) 
-      val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(lquery)
-          
-      val neighbors: RDD[(Long, Map[Int, Iterable[Int]])] = approxNNByPartition(idxModelQuery, 
-          bFullQuery, $(numNeighbors) * priorClass.size, hashOutputCol)
       
+      // Fully broadcast the queried elements (the entire batch)
+      val bFullQuery: Broadcast[Array[Row]] = sc.broadcast(lquery)
+      // For each query element, return N neighbors for each output label.
+      val neighbors: RDD[(Long, Map[Int, Iterable[Int]])] = approxNNByPartition(idxModelQuery, 
+          bFullQuery, $(numNeighbors) * priorClass.size)
+      // Neighbors' positions are again broadcasted as a table (partition, neighbors' positions)
       val bNeighborsTable: Broadcast[Map[Long, Map[Int, Iterable[Int]]]] = 
           sc.broadcast(neighbors.collectAsMap().toMap)
       
+      // Weights obtained in the RELIEF-F phase. Each structure is composed by: feature ID, relevance, redundancy.  
       val (rawWeights: RDD[(Int, (Float, Vector))], partialMarginal, partialCount) =  
           if (!sparse) computeReliefWeights(
               idxModelQuery.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
@@ -214,7 +269,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
               idxModelQuery.select($(inputCol), $(labelCol)), bFullQuery, bNeighborsTable, 
           topFeatures, priorClass, nFeat, nElems)
       
-      // Normalize previous results and return the best features
+      // Normalize previous results and return the most relevant features for this batch/step
       results(i) = rawWeights.cache()      
       val localR = results(i).collect()
       if(results(i).count > 0){ // call the action required to persist data
@@ -223,13 +278,12 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         topFeatures = normalized.takeOrdered(lowerFeat)(scoreOrder.reverse).map(_._1).toSet
       }
         
-      // Partial statistics for redundancy and others
+      // Partial statistics for redundancy
       total += partialCount.value     
       marginalVector = marginalVector match {
         case sv: BSV[Double] => sv += partialMarginal.value.asInstanceOf[BSV[Double]]
         case dv: BDV[Double] => dv += partialMarginal.value
       }
-      //println("# omitted instances in this step: " + skipped)
         
       // Free some resources
       bNeighborsTable.destroy(); bFullQuery.destroy(); idxModelQuery.unpersist();
@@ -237,21 +291,22 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       logInfo("Batch #" + i + " computed in " + btime + "s")
     }
     
+    // Once all batches have been computed, we join and aggregate results
     var tmpWeights: RDD[(Int, (Float, Vector))] = results(0)
     (1 until results.size).foreach{ i => tmpWeights = tmpWeights.union(results(i)) }
     val finalWeights = tmpWeights.reduceByKey({ case((r1, j1), (r2, j2)) => 
       (r1 + r2, Vectors.fromBreeze(j1.asBreeze + j2.asBreeze)) }).cache()
-    
     val nWeights = finalWeights.count()
+
     // Unpersist partial results
     (0 until batches.size).foreach(i => results(i).unpersist())
     
-    // Normalize RELIEF Weights
+    // min-max normalize final RELIEF-F weights
     val onlyWeights = finalWeights.values.map(_._1)
     val maxRelief = onlyWeights.max(); val minRelief = onlyWeights.min()
     val normWeights = finalWeights.mapValues{ case(w, joint) => (w - minRelief) / (maxRelief - minRelief) -> joint}
         
-    // normalized redundancy
+    // Normalize redundancy and show all different rankings
     val rddFinalWeights = computeRedudancy(normWeights, marginalVector, total, nFeat, weight, sparse).cache()
     val (reliefCol, relief) = selectFeatures(rddFinalWeights, nFeat)
     val outRC = reliefCol.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
@@ -273,8 +328,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
   private def approxNNByPartition(
       modelDataset: Dataset[_],
       bModelQuery: Broadcast[Array[Row]],
-      k: Int,
-      hashCol: String): RDD[(Long, Map[Int, Iterable[Int]])] = {
+      k: Int): RDD[(Long, Map[Int, Iterable[Int]])] = {
     
     case class Localization(part: Int, index: Int)
     val sc = modelDataset.sparkSession.sparkContext
