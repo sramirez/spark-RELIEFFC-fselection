@@ -114,21 +114,12 @@ private[feature] trait ReliefFRSelectorParams extends Params
   /**
    * Previous sample is split into several batches to reduce even further derived complexity. In addition,
    * ranking from previous steps will serve to select which features will be involved in redundancy computations.
-   * The default value of estimationRatio is 0.1.
+   * The default value of estimationRatio is 0.25.
    * 
    * @group param
    */
   final val batchSize: DoubleParam = new DoubleParam(this, "batchSize", "", ParamValidators.inRange(0,1))
-  setDefault(batchSize -> 0.1)
-  
-  /**
-   * 
-   * 
-   * @group param 
-   */
-  final val queryStep: IntParam = new IntParam(this, "queryStep", "", ParamValidators.gtEq(1))
-  setDefault(queryStep -> 2)  
-  
+  setDefault(batchSize -> 0.25)
   
   /**
    * Rate of features (with respect to the selection set) that will be involved in redundancy computations. 
@@ -141,7 +132,15 @@ private[feature] trait ReliefFRSelectorParams extends Params
   final val lowerFeatureThreshold: DoubleParam = new DoubleParam(this, "lowerFeatureThreshold", "", ParamValidators.gtEq(1))
   setDefault(lowerFeatureThreshold -> 3.0)
   
-  final val lowerDistanceThreshold: DoubleParam = new DoubleParam(this, "lowerDistanceThreshold", "", ParamValidators.inRange(0,1))
+  /** 
+   *  For continuous attributes, this parameter defines the percentage of maximum distance accounted in REDUNDACY estimations.
+   *  Instead of defining the largest distance as the difference between the maximum and the minimun value in the dataset,
+   *  we rely on Chebyshev's inequality to define the range as that formed by 6 standard deviations. This removes the effect of
+   *  highly skewed outliers in data. Chebyshev's inequality states a minimum of 89% values are within three standard deviations.
+   *  IMPORTANT: As prerequisite, data must be normalized to have 0 mean, and 1 standard deviation.  
+   */
+  final val lowerDistanceThreshold: DoubleParam = new DoubleParam(this, "lowerDistanceThreshold", 
+      "For continuous attributes, this parameter defines the percentage of maximum distance accounted in estimations.", ParamValidators.inRange(0,1))
   setDefault(lowerDistanceThreshold -> 0.8)
   
   /**
@@ -152,10 +151,16 @@ private[feature] trait ReliefFRSelectorParams extends Params
    *
    * @group param
    */
-  final val redundancyRemoval: BooleanParam = new BooleanParam(this, "redundancyRemoval", "If redundancy removal technique is activated or only standard RELIEF-F is performed.")
+  final val redundancyRemoval: BooleanParam = new BooleanParam(this, "redundancyRemoval", 
+      "If redundancy removal technique is activated or only standard RELIEF-F is performed.")
   setDefault(redundancyRemoval -> false)
   
-  final val discreteData: BooleanParam = new BooleanParam(this, "discreteData", "")
+  /**
+   * If input data are discrete, or continuous. Continuous data must have 0 mean, and 1 std for better performing in REDUNDANCY estimations. 
+   * See lowerDistanceThreshold variable for more information.
+   */
+  final val discreteData: BooleanParam = new BooleanParam(this, "discreteData", 
+      "Continuous data must have 0 mean, and 1 std for better performing in REDUNDANCY estimations.")
   setDefault(discreteData -> false)
   
 }
@@ -332,7 +337,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     case class Localization(part: Int, index: Int)
     val sc = modelDataset.sparkSession.sparkContext
-    val qstep = $(queryStep)
     val input = modelDataset.select($(inputCol))
     val icol = $(inputCol)
     
@@ -360,6 +364,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     neighbors
   }
   
+  /* Enum class */
   object MOD {
     val sameClass = 0
     val otherClass = 1

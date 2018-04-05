@@ -34,8 +34,8 @@ object TestHelper {
   
   def createSelectorModel(sqlContext: SQLContext, dataframe: Dataset[_], inputCols: Array[String],
                              labelColumn: String,
-                             nPartitions: Int = 100,
-                             numTopFeatures: Int = 20, 
+                             numTopFeatures: Int = 20,
+                             discreteData: Boolean = true,
                              allVectorsDense: Boolean = true,
                              padded: Int = 0 /* if minimum value is negative */): ReliefFRSelectorModel = {
     val featureAssembler = new VectorAssembler()
@@ -61,6 +61,9 @@ object TestHelper {
       
     val selector = new ReliefFRSelector()
         .setNumTopFeatures(numTopFeatures)
+        .setSeed(123456789L)
+        .setDiscreteData(discreteData)
+        .setEstimationRatio(1.0)
         .setInputCol("features")// this must be a feature vector
         .setLabelCol(labelColumn + INDEX_SUFFIX)
         .setOutputCol("selectedFeatures")
@@ -75,13 +78,13 @@ object TestHelper {
     */
   def getSelectorModel(sqlContext: SQLContext, dataframe: DataFrame, inputCols: Array[String],
                           labelColumn: String,
-                             nPartitions: Int = 100,
                              numTopFeatures: Int = 20,
+                             discreteData: Boolean = true,
                              allVectorsDense: Boolean = true,
                              padded: Int = 0): ReliefFRSelectorModel = {
     val processedDf = cleanLabelCol(dataframe, labelColumn)
-    createSelectorModel(sqlContext, processedDf, inputCols, labelColumn, 
-        nPartitions, numTopFeatures, allVectorsDense, padded)
+    createSelectorModel(sqlContext, processedDf, inputCols, labelColumn,
+        numTopFeatures, discreteData, allVectorsDense, padded)
   }
 
 

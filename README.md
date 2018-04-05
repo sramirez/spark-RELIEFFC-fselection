@@ -1,62 +1,48 @@
-An Information Theoretic Feature Selection Framework
+RELIEF-F feature selection for Apache Spark
 =====================================================
 
-The present framework implements Feature Selection (FS) on Spark for its application on Big Data problems. This package contains a generic implementation of greedy Information Theoretic Feature Selection methods. The implementation is based on the common theoretic framework presented in [1]. Implementations of mRMR, InfoGain, JMI and other commonly used FS filters are provided. In addition, the framework can be extended with other criteria provided by the user as long as the process complies with the framework proposed in [1].
+The present algorithm (called BELIEF) implements Feature Weighting (FW) on Spark for its application on Big Data problems. This repository contains an improved implementation of RELIEF-F algorithm [1], which has been extended with a cheap but effective feature redundancy elimination technique. BELIEF leverages distance computations computed in prior steps to estimate inter-feature redundancy relationships at virtually no cost. BELIEF is also highly scalable to different sample sizes, from hundreds of samples to thousands. 
 
-Spark package: http://spark-packages.org/package/sramirez/spark-infotheoretic-feature-selection
+Spark package: Soon.
 
 ## Main features:
 
-* Version for new ml library.
+* Compliance with 2.2.0 Spark version, and ml API.
 * Support for sparse data and high-dimensional datasets (millions of features).
-* Improved performance (less than 1 minute per iteration for datasets like ECBDL14 and kddb with 400 cores).
+* Include a new heuristic that removes redundant features from the final selection set.
+* Scalable to large sample sets.
 
-This work has associated two submitted contributions to international journals which will be attached to this request as soon as they are accepted. This software has been proved with two large real-world datasets such as:
+This software has been tested on several large-scale datasets, such as:
 
-- A dataset selected for the GECCO-2014 in Vancouver, July 13th, 2014 competition, which comes from the Protein Structure Prediction field (http://cruncher.ncl.ac.uk/bdcomp/). We have created a oversampling version of this dataset with 64 million instances, 631 attributes, 2 classes.
-- kddb dataset: http://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/binary.html#kdd2010%20%28bridge%20to%20algebra%29. 20M instances and almost 30M of attributes.
+- Oversampled ECBDL14 dataset (64M instances, 631 features): a dataset selected for the GECCO-2014 in Vancouver, July 13th, 2014 competition, which comes from the Protein Structure Prediction field (http://cruncher.ncl.ac.uk/bdcomp/). 
+- kddb dataset (20M instances, nearly 30M of features): http://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/binary.html#kdd2010%20%28bridge%20to%20algebra%29.
 
 ## Example (ml): 
 	import org.apache.spark.ml.feature._
-	val selector = new InfoThSelector()
-		.setSelectCriterion("mrmr")
-	      	.setNPartitions(100)
-	      	.setNumTopFeatures(10)
-	      	.setFeaturesCol("features")
-	      	.setLabelCol("class")
-	      	.setOutputCol("selectedFeatures")
-   
+	val selector = new ReliefFRSelector()
+        	.setNumTopFeatures(10)
+		.setEstimationRatio(0.1) 
+        	.setSeed(123456789L) // for sampling
+		.setNumNeighbors(5) // k-NN used in RELIEF
+        	.setDiscreteData(true)
+        	.setInputCol("features")// this must be a feature vector
+        	.setLabelCol("labelCol")
+        	.setOutputCol("selectedFeatures")
+
+
 	val result = selector.fit(df).transform(df)
-
-## Example (MLLIB): 
-	import org.apache.spark.mllib.feature._
-	val criterion = new InfoThCriterionFactory("mrmr")
-	val nToSelect = 100
-	val nPartitions = 100
-	
-	println("*** FS criterion: " + criterion.getCriterion.toString)
-	println("*** Number of features to select: " + nToSelect)
-	println("*** Number of partitions: " + nPartitions)
-	
-	val featureSelector = new InfoThSelector(criterion, nToSelect, nPartitions).fit(data)
-	
-	val reduced = data.map(i => LabeledPoint(i.label, featureSelector.transform(i.features)))
-	reduced.first()
-        
-
-Design doc: https://docs.google.com/document/d/1HOaPL_HJzTbL2tVdzbTjhr5wxVvPe9e-23S7rc2VcsY/edit?usp=sharing
 
 ## Prerequisites:
 
-LabeledPoint data must be discretized as integer values in double representation with a maximum of 256 distinct values. 
-By doing so, data can be transformed to byte type directly, making the selection process much more efficient.
+Continuous data must have 0 mean, and 1 std to achieve a better performing in REDUNDANCY estimations.
+Standard scaler in ML library may be used to fulfill this recommendation:
+
+https://spark.apache.org/docs/latest/ml-features.html#standardscaler
 
 ## Contributors
 
 - Sergio Ramírez-Gallego (sramirez@decsai.ugr.es) (main contributor and maintainer).
-- Héctor Mouriño-Talín (h.mtalin@udc.es)
-- David Martínez-Rego (dmartinez@udc.es)
 
 ##References
 
-[1] Brown, G., Pocock, A., Zhao, M. J., & Luján, M. (2012). "Conditional likelihood maximisation: a unifying framework for information theoretic feature selection." The Journal of Machine Learning Research, 13(1), 27-66.
+[1] I. Kononenko, E. Simec, M. Robnik-Sikonja, Overcoming the myopia of inductive learning algorithms with RELIEFF, Applied Intelligence 7 (1) (1997) 39–55.
