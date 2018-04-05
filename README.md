@@ -43,6 +43,6 @@ https://spark.apache.org/docs/latest/ml-features.html#standardscaler
 
 - Sergio Ramírez-Gallego (sramirez@decsai.ugr.es) (main contributor and maintainer).
 
-##References
+## References
 
 [1] I. Kononenko, E. Simec, M. Robnik-Sikonja, Overcoming the myopia of inductive learning algorithms with RELIEFF, Applied Intelligence 7 (1) (1997) 39–55.
