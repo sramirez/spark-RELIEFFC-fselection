@@ -3,7 +3,7 @@ RELIEF-F feature selection for Apache Spark
 
 The present algorithm (called BELIEF) implements Feature Weighting (FW) on Spark for its application on Big Data problems. This repository contains an improved implementation of RELIEF-F algorithm [1], which has been extended with a cheap but effective feature redundancy elimination technique. BELIEF leverages distance computations computed in prior steps to estimate inter-feature redundancy relationships at virtually no cost. BELIEF is also highly scalable to different sample sizes, from hundreds of samples to thousands. 
 
-Spark package: Soon.
+Spark package: https://spark-packages.org/package/sramirez/spark-RELIEFFC-fselection.
 
 ## Main features:
 
