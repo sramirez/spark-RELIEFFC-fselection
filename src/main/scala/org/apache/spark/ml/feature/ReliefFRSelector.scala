@@ -416,7 +416,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                     val distanceThreshold = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
                     neighbors.map{ lidx =>
                       val Row(ninput: Vector, nlabel: Double) = localExamples(lidx)
-                      val labelIndex = label2Num.get(nlabel.toFloat).get
+                      val labelIndex = label2Num(nlabel)
                       val mod = if(nlabel == qlabel) label2Num.size * MOD.sameClass else label2Num.size * MOD.otherClass
                       classCounter(labelIndex + mod) += 1
                             
