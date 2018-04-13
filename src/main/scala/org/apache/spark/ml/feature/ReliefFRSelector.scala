@@ -29,7 +29,7 @@ import org.apache.spark.ml.util._
 import org.apache.spark.ml.linalg.Vectors
 import org.apache.spark.ml.util.MatrixAccumulator
 import org.apache.spark.ml.util.VectorAccumulator
-import org.apache.spark.ml.util.BoundedPriorityQueue
+import org.apache.spark.ml.util.{BoundedPriorityQueue => BPQ}
 import org.apache.spark.ml.linalg.SparseVector
 import org.apache.spark.mllib.feature
 import org.apache.spark.mllib.linalg.{ Vectors => OldVectors }
@@ -329,7 +329,6 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       partialWeights.mapValues{ x => (x - minRelief) / (maxRelief - minRelief)}
   }  
   
-  // TODO: Fix the MultiProbe NN Search in SPARK-18454
   private def approxNNByPartition(
       modelDataset: Dataset[_],
       bModelQuery: Broadcast[Array[Row]],
@@ -337,21 +336,23 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     case class Localization(part: Int, index: Int)
     val sc = modelDataset.sparkSession.sparkContext
-    val input = modelDataset.select($(inputCol))
-    val icol = $(inputCol)
+    val icol = $(inputCol) // Use local variables to avoid shuffle the entire object RELIEFSELECTOR to each map.
+    val input: RDD[Row] = modelDataset.select(icol).rdd
     
-    val neighbors = input.rdd.mapPartitionsWithIndex { 
+    val neighbors: RDD[(Long, Map[Int, Iterable[Int]])] = input.mapPartitionsWithIndex { 
       case (pindex, it) => 
           // Initialize the map composed by the priority queue and the central element's ID
-          val query = bModelQuery.value // Fields: "UniqueID", $(inputCol), $(labelCol), "hashOutputCol"
-          val ordering = Ordering[Float].on[(Float, Localization)](_._1).reverse// BPQ needs reverse ordering   
-          val neighbors = query.map { r => r.getAs[Long]("UniqueID") -> new BoundedPriorityQueue[(Float, Localization)](k)(ordering) }   
+          val query = bModelQuery.value // Query set. Fields: "UniqueID", $(inputCol), $(labelCol)
+          val ordering = Ordering[Float].on[(Float, Localization)](_._1).reverse// BPQ needs reverse ordering 
+          // BPQ to sort from closer neighbors to farther (to be fullfilled below)
+          val neighbors = query.map { r => r.getAs[Long]("UniqueID") -> 
+              new BPQ[(Float, Localization)](k)(ordering) 
+            }   
       
-          var i = 0
-          // First iterate over the local elements, and then over the sampled set (also called query set).
-          while(it.hasNext) {
+          var i = 0 // index for local elements in this partition.
+          while(it.hasNext) { // local elements
             val inputNeig = it.next.getAs[Vector](icol)
-              (0 until query.size).foreach { j => 
+              (0 until query.size).foreach { j => // query elements broadcasted
                  val distance = Math.sqrt(Vectors.sqdist(query(j).getAs[Vector](icol), inputNeig)).toFloat
                  neighbors(j)._2 += distance -> Localization(pindex.toShort, i)    
                }
@@ -360,6 +361,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
           neighbors.toIterator
       }.reduceByKey(_ ++= _).mapValues(
           _.map(l => Localization.unapply(l._2).get).groupBy(_._1).mapValues(_.map(_._2)).map(identity)) 
+      // Select nearest neighbors from all partitions. For each query element, create a map (partitionID, list of local indices)   
       // map(identity) needed to fix bug: https://issues.scala-lang.org/browse/SI-7005
     neighbors
   }
@@ -377,18 +379,21 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       topFeatures: Set[Int],
       priorClass: Map[Double, Float],
       nFeat: Int,
-      nElems: Long
-      ) = {
+      nElems: Long) = {
     
-     // Initialize accumulators for RELIEF+Collision computation
+    // Auxiliary vars
     val sc = modelDataset.sparkSession.sparkContext
+    val label2Num = priorClass.zipWithIndex.map{case (k, v) => k._1 -> v} // Output labels to numeric indices
+    val idxPriorClass = priorClass.zipWithIndex.map{case (k, v) => v -> k._2}
+    
+    // Accumulators and broadcasted vars
     val accMarginal = new VectorAccumulator(nFeat, sparse = false); sc.register(accMarginal, "marginal")
     val accJoint = new MatrixAccumulator(nFeat, nFeat, sparse = false); sc.register(accJoint, "joint")
     val totalInteractions = sc.longAccumulator("totalInteractions")
-    val label2Num = priorClass.zipWithIndex.map{case (k, v) => k._1 -> v}
-    val idxPriorClass = priorClass.zipWithIndex.map{case (k, v) => v -> k._2}
     val bClassCounter = new VectorAccumulator(label2Num.size * 2, sparse = false); sc.register(bClassCounter, "classCounter")
     val bTF = sc.broadcast(topFeatures)
+    
+    // Use local vars to avoid sending the entire RELIEF object to maps
     val isCont = !$(discreteData); val lowerDistanceTh = $(lowerDistanceThreshold); val icol = $(inputCol); val lcol = $(labelCol)
         
     val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { case(pindex, it) =>
@@ -422,10 +427,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                             
                       qinput.foreachActive{ (index, value) =>
                          val fdistance = math.abs(value - ninput(index))
-                         //// RELIEF Computations
+                         //// Annotate RELIEF computations
                          reliefWeights(index)._1(labelIndex + mod) += fdistance.toFloat
-                         //// Check if there exist a collision
-                         // The closer the distance, the more probable.
+                         ////// mCR functionality (collision detection)
+                         // The closer the distance, the more probable is the co-occurrence.
                          if(fdistance <= distanceThreshold){
                             val contribution = vote(fdistance)
                             marginal(index) += contribution

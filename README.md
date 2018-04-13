@@ -34,10 +34,11 @@ This software has been tested on several large-scale datasets, such as:
 
 ## Prerequisites:
 
-Continuous data must have 0 mean, and 1 std to achieve a better performing in REDUNDANCY estimations.
-Standard scaler in ML library may be used to fulfill this recommendation:
+RELIEF computations are required to be normalized to improve comparisons among feature ranks and nearest neighbor searches. Additionally, continuous data should have 0 mean, and 1 standard deviation for a better performing in REDUNDANCY estimations. We recommend to rely on MLLIB standard scaler to homogeneize data:
 
 https://spark.apache.org/docs/latest/ml-features.html#standardscaler
+
+Likewise, one-hot encoder is recommended for nominal features (unordered discrete data)
 
 ## Contributors
 
