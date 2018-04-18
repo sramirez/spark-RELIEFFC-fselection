@@ -387,25 +387,29 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val idxPriorClass: Map[Int, Float] = priorClass.zipWithIndex.map{case (k, v) => v -> k._2} // Proportion by class
     
     // Accumulators and broadcasted vars
-    val accMarginal = new VectorAccumulator(nFeat, sparse = false); sc.register(accMarginal, "marginal")
-    val accJoint = new MatrixAccumulator(nFeat, nFeat, sparse = false); sc.register(accJoint, "joint")
+    val accRedMarginal = new VectorAccumulator(nFeat, sparse = false); sc.register(accRedMarginal, "marginal")
+    val accRedJoint = new MatrixAccumulator(nFeat, nFeat, sparse = false); sc.register(accRedJoint, "joint")
     val totalInteractions = sc.longAccumulator("totalInteractions")
     val bClassCounter = new VectorAccumulator(label2Num.size * 2, sparse = false); sc.register(bClassCounter, "classCounter")
-    val bTF = sc.broadcast(topFeatures)
+    val bTF: Broadcast[Set[Int]] = sc.broadcast(topFeatures)
     
-    // Use local vars to avoid sending the entire RELIEF object to maps
+    // Use local vars to avoid sending the entire object to mappers
     val isCont = !$(discreteData); val lowerDistanceTh = $(lowerDistanceThreshold); val icol = $(inputCol); val lcol = $(labelCol)
         
-    val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { case(pindex, it) =>
+    // Left side: relevance, right side: redundancy joint
+    val rawReliefWeights: RDD[(Int, (BDV[Float], Vector))] = 
+      modelDataset.rdd.mapPartitionsWithIndex { case(pindex, it) =>
         // last position is reserved to negative weights from central instances.
         val localExamples = it.toArray
         val r = new scala.util.Random($(seed))
         val marginal = BDV.zeros[Double](nFeat) // Marginal proportions computed for [redundancy]
         // Matrix with # features columns and 2 * # labels rows for [relevance]
-        // Labels are duplicated for instances do / don't share class with a given instance
-        val reliefWeights = BDV.fill[(BDV[Float], BDV[Double])](nFeat)(
-            (BDV.zeros[Float](label2Num.size * 2), BDV.zeros[Double](nFeat)))
-        val classCounter = BDV.zeros[Double](label2Num.size * 2)        
+        // Labels are duplicated to distinguish between instances that do/don't share class with query
+        // Left side: relevance, right side: redundancy joint
+        val reliefWeights: BDV[(BDV[Float], BDV[Double])] = 
+          BDV.fill[(BDV[Float], BDV[Double])](nFeat)(
+              (BDV.zeros[Float](label2Num.size * 2), BDV.zeros[Double](nFeat)))
+        val classCounter: BDV[Double] = BDV.zeros[Double](label2Num.size * 2)      
         
         // Data are assumed to be scaled to have 0 mean, and 1 std. Checks are costly, so they're skipped
         val vote = if(isCont) (d: Double) => 1 - math.min(6.0, d) / 6.0 else (d: Double) => Double.MinPositiveValue
@@ -415,7 +419,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                       
         // Compute redundancy and relevancy contributions among the query set and the neighborhood set
         bModelQuery.value.map{ row =>
-            val qid = row.getAs[Long]("UniqueID"); val qinput = row.getAs[Vector](icol); val qlabel = row.getAs[Double](lcol)
+            val qid = row.getAs[Long]("UniqueID"); val qinput = row.getAs[Vector](icol)
+            val qlabel = row.getAs[Double](lcol)
             bNeighborsTable.value.get(qid) match { 
               case Some(localMap) =>
                 localMap.get(pindex) match {
@@ -458,31 +463,19 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             }
       }
       // update accumulated matrices 
-      accMarginal.add(marginal)
+      accRedMarginal.add(marginal)
       totalInteractions.add(classCounter.sum.toLong)
       bClassCounter.add(classCounter)
-      reliefWeights.iterator
-        
-    }.reduceByKey{ case((r1, j1), (r2, j2)) => (r1 + r2, j1 + j2) }
+      // Left side: relevance, right side: redundancy joint 
+      reliefWeights.iterator      
+    }.reduceByKey{ case((r1, j1), (r2, j2)) => (r1 + r2, j1 + j2) }.mapValues{ 
+          case (rel, red) => rel -> Vectors.fromBreeze(red)
+        }
       
-      val cc = bClassCounter.value
-      val weights = rawReliefWeights.mapValues { case (reliefByClass, joint) =>
-         val nClasses = idxPriorClass.size
-         var sum = 0.0f
-         reliefByClass.foreachPair{ case (classMod, value) =>
-             val contrib = if(cc(classMod) > 0) {
-               val sign = if(classMod / nClasses == MOD.sameClass) -1 else 1
-               sign * idxPriorClass.get(classMod % nClasses).get * (value / cc(classMod).toFloat)
-             } else {
-               0.0f
-             }
-             sum += contrib
-         }
-         sum -> Vectors.fromBreeze(joint)
-      }
-      
+    val weights: RDD[(Int, (Float, Vector))] = 
+        aggregateWeightsByFeat(rawReliefWeights, bClassCounter, idxPriorClass)
          
-    (weights, accMarginal, totalInteractions)
+    (weights, accRedMarginal, totalInteractions)
   }
   
   private def computeReliefWeightsSparse (
@@ -495,23 +488,31 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       nElems: Long
       ) = {
     
-         // Initialize accumulators for RELIEF+Collision computation
+      // Auxiliary vars
       val sc = modelDataset.sparkSession.sparkContext
-      val accMarginal = new VectorAccumulator(nFeat, sparse = true); sc.register(accMarginal, "marginal")
+      val label2Num: Map[Double, Int] = priorClass.zipWithIndex.map{case (k, v) => k._1 -> v} // Output labels to numeric indices
+      val idxPriorClass: Map[Int, Float] = priorClass.zipWithIndex.map{case (k, v) => v -> k._2} // Proportion by class
+      
+      // Accumulators and broadcasted vars
+      val accRedMarginal = new VectorAccumulator(nFeat, sparse = true); sc.register(accRedMarginal, "marginal")
       val totalInteractions = sc.longAccumulator("totalInteractions")
-      val label2Num = priorClass.zipWithIndex.map{case (k, v) => k._1 -> v}
-      val idxPriorClass = priorClass.zipWithIndex.map{case (k, v) => v -> k._2}
       val bClassCounter = new VectorAccumulator(label2Num.size * 2, sparse = false); sc.register(bClassCounter, "classCounter")
-      val bTF = sc.broadcast(topFeatures)
+      val bTF: Broadcast[Set[Int]] = sc.broadcast(topFeatures)
+    
+      // Use local vars to avoid sending the entire object to mappers
       val isCont = !$(discreteData); val lowerDistanceTh = $(lowerDistanceThreshold); val icol = $(inputCol); val lcol = $(labelCol)
       val lseed = $(seed)
-          
-      val rawReliefWeights = modelDataset.rdd.mapPartitionsWithIndex { case(pindex, it) =>
+      
+      // Left side: relevance, right side: redundancy joint
+      val rawReliefWeights: RDD[(Int, (BDV[Float], Vector))] = 
+        modelDataset.rdd.mapPartitionsWithIndex { case(pindex, it) =>
           // last position is reserved to negative weights from central instances.
           val localExamples = it.toArray
-          val marginal = new VectorBuilder[Double](nFeat)
-          //val joint = new ArrayBuffer[(Int, Int, Double)]
+          val marginal = new VectorBuilder[Double](nFeat) // Marginal proportions computed for [redundancy]
+          // Left side: relevance, right side: redundancy joint
           val reliefWeights = new HashMap[Int, (BDV[Float], VectorBuilder[Double])]
+          // Vector with 2 * # labels positions for [relevance]
+          // Labels are duplicated to distinguish between instances that do/don't share class with query
           val classCounter = BDV.zeros[Double](label2Num.size * 2)        
           val r = new scala.util.Random(lseed)
           // Data are assumed to be scaled to have 0 mean, and 1 std
@@ -525,19 +526,19 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                   localMap.get(pindex) match {
                     case Some(neighbors) =>
                       val rnumber = r.nextFloat()
+                      // Distance values greater than the threshold will be considered as outliers (lowerdistanceTh * 6 times std deviation)
                       val distanceThreshold = if(isCont) 6 * (1 - (lowerDistanceTh + rnumber * lowerDistanceTh)) else 0.0f
                       neighbors.map{ lidx =>
                         val Row(ninput: SparseVector, nlabel: Double) = localExamples(lidx)
                         val labelIndex = label2Num.get(nlabel.toFloat).get
                         val mod = if(nlabel == qlabel) label2Num.size * MOD.sameClass else label2Num.size * MOD.otherClass
                         classCounter(labelIndex + mod) += 1
-    
+                        // Perform standard loop to fetch sparse vectors
                         val v1Indices = qinput.indices; val nnzv1 = v1Indices.length; var kv1 = 0
                         val v2Indices = ninput.indices; val nnzv2 = v2Indices.length; var kv2 = 0
                         
                         while (kv1 < nnzv1 || kv2 < nnzv2) {
-                          var score = 0.0; var index = kv1
-                
+                          var score = 0.0; var index = kv1                
                           if (kv2 >= nnzv2 || (kv1 < nnzv1 && v1Indices(kv1) < v2Indices(kv2))) {
                             score = qinput.values(kv1); kv1 += 1; index = kv1
                           } else if (kv1 >= nnzv1 || (kv2 < nnzv2 && v2Indices(kv2) < v1Indices(kv1))) {
@@ -545,8 +546,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                           } else {
                             score = qinput.values(kv1) - ninput.values(kv2); kv1 += 1; kv2 += 1; index = kv1
                           }
+                          
                           val fdistance = math.abs(score)
                           //// RELIEF Computations
+                          // Update hashMap with contributions for each featurek
                           val stats = reliefWeights.get(index) match {
                             case Some(st) => 
                               st._1(labelIndex + mod) += fdistance.toFloat
@@ -581,29 +584,45 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
             }
         }
         // update accumulated matrices  
-        accMarginal.add(marginal.toSparseVector)        
+        accRedMarginal.add(marginal.toSparseVector)        
         totalInteractions.add(classCounter.sum.toLong)
         bClassCounter.add(classCounter)
         reliefWeights.mapValues{ case(relief, joint) => relief -> joint.toSparseVector }.iterator
         
-      }.reduceByKey{ case((r1, j1), (r2, j2)) => (r1 + r2, j1 + j2) }
+      }.reduceByKey{ case((r1, j1), (r2, j2)) => (r1 + r2, j1 + j2) }.mapValues{ 
+          case (rel, red) => rel -> Vectors.fromBreeze(red)
+        }
       
-      val cc = bClassCounter.value
-      val weights = rawReliefWeights.mapValues { case (reliefByClass, joint) =>
-         val nClasses = idxPriorClass.size; var sum = 0.0f
-         reliefByClass.foreachPair{ case (classMod, value) =>
-             val contrib = if(cc(classMod) > 0) {
-               val sign = if(classMod / nClasses == MOD.sameClass) -1 else 1
+      val weights: RDD[(Int, (Float, Vector))] = 
+        aggregateWeightsByFeat(rawReliefWeights, bClassCounter, idxPriorClass)
+      
+      (weights, accRedMarginal, totalInteractions)
+  }
+  
+  private def aggregateWeightsByFeat(
+      rawReliefWeights: RDD[(Int, (BDV[Float], Vector))], 
+      bClassCounter: VectorAccumulator,
+      idxPriorClass: Map[Int, Float]) = {
+    
+    val cc: BV[Double] = bClassCounter.value
+    // Aggregate final relevance weights and joint contributions to redundancy by feature
+    val reliefWeights: RDD[(Int, (Float, Vector))] = rawReliefWeights.mapValues { 
+      case (relevanceByClass, redudancyJoint) =>
+       val nClasses = idxPriorClass.size; var sum = 0.0f
+       relevanceByClass.foreachPair{ case (classMod, value) =>
+           val contrib = if(cc(classMod) > 0) {
+               val sign = if(classMod / nClasses == MOD.sameClass) -1 else 1 // class is shared?
+               // negative/positive contribution + class weight + value / number of neighbors implied
                sign * idxPriorClass.get(classMod % nClasses).get * (value / cc(classMod).toFloat)
              } else {
                0.0f
              }
-             sum += contrib
-         }
-         sum -> Vectors.fromBreeze(joint)
-      }
-      
-      (weights, accMarginal, totalInteractions)
+           sum += contrib
+       }
+       sum -> redudancyJoint
+    }
+    
+    reliefWeights
   }
   
   private def computeRedudancy(weights: RDD[(Int, (Float, Vector))], rawMarginal: BV[Double], 
