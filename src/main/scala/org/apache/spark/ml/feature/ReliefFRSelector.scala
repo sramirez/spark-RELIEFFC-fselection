@@ -69,7 +69,7 @@ private[feature] trait ReliefFRSelectorParams extends Params
     with HasInputCol with HasOutputCol with HasLabelCol with HasSeed {
 
   /**
-   * Relief + redundancy removal based on co-ocurrences. Both are used to rank features.
+   * Relief + redundancy removal based on co-occurrences. Both are used to rank features.
    *
    * @group param
    */
@@ -222,10 +222,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     // Sample estimation rate
     val sample = modelDataset.sample(false, $(estimationRatio), $(seed))
     val sampledSize = sample.count()
-    val maxWeight = if(!sparse) Integer.MAX_VALUE / 8 / (nFeat + 2) / sampledSize else $(batchSize) 
+    val maxSizeAllowed = if(!sparse) Integer.MAX_VALUE / 8 / (nFeat + 2) / sampledSize else $(batchSize) 
     // In order to avoid batches broadcasted exceed the maximum set to Integer.MAX_VALUE (about 2,3 GB)
-    val weight = math.min($(batchSize), maxWeight)
-    val nbatches = (1 / weight).toInt
+    val maxBatchSize = math.min($(batchSize), maxSizeAllowed)
+    val nbatches = (1 / maxBatchSize).toInt
     
     // Display basic information
     logInfo("# of elements: " + nElems)
@@ -234,11 +234,11 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     logInfo("Computed lower threshold for features: " + lowerFeat)
     logInfo("Class distribution: " + priorClass.toString())
     logInfo("Sampled size: " + sampledSize)
-    logInfo("Sampling percentage per batch: " + weight)
+    logInfo("Sampling percentage per batch: " + maxBatchSize)
     logInfo("Number of batches: " + nbatches)
     
     // Split into batches
-    val weights = Array.fill(nbatches)(weight)
+    val weights = Array.fill(nbatches)(maxBatchSize)
     val batches = sample.randomSplit(weights, $(seed))
     var topFeatures: Set[Int] = Set.empty
     var featureWeights: BV[Float] = if (sparse) BSV.zeros(nFeat) else BV.zeros(nFeat)
@@ -311,18 +311,20 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     val maxRelief = onlyWeights.max(); val minRelief = onlyWeights.min()
     val normWeights = finalWeights.mapValues{ case(w, joint) => (w - minRelief) / (maxRelief - minRelief) -> joint}
         
-    // Normalize redundancy and show all different rankings
-    val rddFinalWeights = computeRedudancy(normWeights, marginalVector, total, nFeat, weight, sparse).cache()
-    val (reliefCol, relief) = selectFeatures(rddFinalWeights, nFeat)
-    val outRC = reliefCol.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
-    val outR = relief.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
+    // Compute and normalize redundancy score, and show feature ranking with and w/o the redundancy factor
+    val rddFinalWeights = computeRedudancy(normWeights, marginalVector, total, nFeat, maxBatchSize, sparse).cache()
+    
+    val (reliefRed, stdRelief) = selectFeatures(rddFinalWeights, nFeat)
+    val outRC = reliefRed.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
+    val outR = stdRelief.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
     println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\tRelevance\tRedundancy\n" + outRC)
     println("\n*** RELIEF selected features ***\nFeature\tScore\tRelevance\tRedundancy\n" + outR)
     
-    val model = new ReliefFRSelectorModel(uid, relief.map(_.feat).toArray, reliefCol.map(_.feat).toArray)
+    val model = new ReliefFRSelectorModel(uid, stdRelief.map(_.feat).toArray, reliefRed.map(_.feat).toArray)
     copyValues(model)
   }
   
+  /** Normalize ranking in each iteration to know which features should be involved in redundancy computations **/
   private def normalizeRankingDF(partialWeights: RDD[(Int, Float)]) = {
       val maxRelief = partialWeights.values.max()
       val minRelief = partialWeights.values.min()
@@ -561,7 +563,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                               st
                           }
                           
-                          //// Check if there exist a collision
+                          //// Check co-occurrences for redundancy
                           // The closer the distance, the more probable.
                            if(fdistance <= distanceThreshold){
                               marginal.add(index, vote)
@@ -599,13 +601,14 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       (weights, accRedMarginal, totalInteractions)
   }
   
+  /** Once performed partition-wise computations, aggregate contributions to create feature-based scores **/
   private def aggregateWeightsByFeat(
       rawReliefWeights: RDD[(Int, (BDV[Float], Vector))], 
       bClassCounter: VectorAccumulator,
-      idxPriorClass: Map[Int, Float]) = {
+      idxPriorClass: Map[Int, Float]): RDD[(Int, (Float, Vector))] = {
     
     val cc: BV[Double] = bClassCounter.value
-    // Aggregate final relevance weights and joint contributions to redundancy by feature
+    // Aggregate final relevance weights and joint contributions to create redundancy scores by feature
     val reliefWeights: RDD[(Int, (Float, Vector))] = rawReliefWeights.mapValues { 
       case (relevanceByClass, redudancyJoint) =>
        val nClasses = idxPriorClass.size; var sum = 0.0f
@@ -625,77 +628,87 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     reliefWeights
   }
   
-  private def computeRedudancy(weights: RDD[(Int, (Float, Vector))], rawMarginal: BV[Double], 
-      total: Long, nFeat: Int, weight: Double, sparse: Boolean) = {
+  /** Transform co-occurrences to redundancy scores using marginal and joint annotations **/
+  private def computeRedudancy(
+      weights: RDD[(Int, (Float, Vector))], 
+      rawMarginal: BV[Double], 
+      total: Long, 
+      nFeat: Int, 
+      batchPerc: Double, 
+      sparse: Boolean): RDD[(Int, (Float, Vector))] = {
     // Now compute redundancy based on collisions and normalize it
     val factor = if($(discreteData) || sparse) Double.MinPositiveValue else 1.0
-    val marginal = rawMarginal.mapActiveValues(_ /  (total * factor))   
-    val jointTotal = total * factor * (1 - $(estimationRatio) * weight) // we omit the first batch
+    val marginal: BV[Double] = rawMarginal.mapActiveValues(_ / (total * factor))
+    val jointTotal = total * factor * (1 - $(estimationRatio) * batchPerc) // the total number of co-ocurrences omitting those in the first batch
     
-    // Apply the factor and the entropy formula
+    // Function that compute joint entropy between two features given a joint value
     val applyEntropy = (i1: Int, i2: Int, value: Double) => {
       val jprob = value / jointTotal
       val red = jprob * log2(jprob / (marginal(i1) * marginal(i2)))  
-      if(!red.isNaN()) red else 0
+      if(!red.isNaN()) red else 0.0d
     }
     
-    val entropyWeights = weights.map{ case (i1,(w, joint)) => 
-      val res = joint.asBreeze match {
-   
-      case sv: BSV[Double] => 
-          sv.mapActivePairs{case (i2, value) => applyEntropy(i1, i2, value)}
-        case dv: BDV[Double] => 
-          dv.mapActivePairs{case (i2, value) => applyEntropy(i1, i2, value)}
-      }
-      i1 -> (w, Vectors.fromBreeze(res))
+    // Apply the previous function to each pair of features in jointRedundancy
+    val entropyWeights: RDD[(Int, (Float, Vector))] = weights.map{ 
+      case (i1, (relevance, jointRedundancy)) => 
+        val res = jointRedundancy.asBreeze match {   
+          case sv: BSV[Double] => 
+            sv.mapActivePairs{case (i2, value) => applyEntropy(i1, i2, value)}
+          case dv: BDV[Double] => 
+            dv.mapActivePairs{case (i2, value) => applyEntropy(i1, i2, value)}
+        }
+        i1 -> (relevance, Vectors.fromBreeze(res))
     }
     
     val maxRed = entropyWeights.values.map{ case (_, joint) => joint.asBreeze.max}.max
     val minRed = entropyWeights.values.map{ case (_, joint) => joint.asBreeze.min}.min
     
-    entropyWeights.mapValues{ case (w, joint) => 
-      val res = joint.asBreeze match {
-        case sv: BSV[Double] => 
-          sv.mapActiveValues(e => (e - minRed) / (maxRed - minRed))
-        case dv: BDV[Double] => 
-          dv.mapActiveValues(e => (e - minRed) / (maxRed - minRed))
-      }
-      w -> Vectors.fromBreeze(res)
+    // Finally, normalize redundancy scores with minmax procedure
+    val normalizedWeights: RDD[(Int, (Float, Vector))] = entropyWeights.mapValues{ 
+      case (w, joint) => 
+        val res = joint.asBreeze match {
+          case sv: BSV[Double] => 
+            sv.mapActiveValues(e => (e - minRed) / (maxRed - minRed))
+          case dv: BDV[Double] => 
+            dv.mapActiveValues(e => (e - minRed) / (maxRed - minRed))
+        }
+        w -> Vectors.fromBreeze(res)
     }
     
+    normalizedWeights
   }
 
   // Case class for criteria/feature
   case class F(feat: Int, crit: FeatureScore)
   
-  def selectFeatures(reliefRanking: RDD[(Int, (Float, Vector))], nFeat: Int): (Seq[F], Seq[F]) = {
+  /** Greedy process to select best N features according to relevance and redundancy scores **/
+  private def selectFeatures(reliefRanking: RDD[(Int, (Float, Vector))], nFeat: Int): (Seq[F], Seq[F]) = {
     
-    // Initialize all (except the class) criteria with the relevance values
+    // Initialize standard RELIEF only with the relevance scores
     implicit def scoreOrder: Ordering[(Int, (Float, Vector))] = Ordering.by{ r => (-r._2._1, r._1) }
-    val reliefNoColl = reliefRanking.takeOrdered($(numTopFeatures))(scoreOrder).map{ 
+    val stdRanking: Seq[F] = reliefRanking.takeOrdered($(numTopFeatures))(scoreOrder).map{ 
           case (feat, (crit, _)) => F(feat, new FeatureScore().init(crit.toFloat)) }.toSeq
-    val actualWeights = reliefRanking.mapValues{ 
-            case(score, red) => 
-              new FeatureScore().init(score.toFloat) -> red
+    val reliefRed: Array[(Int, (FeatureScore, Vector))] = reliefRanking.mapValues{ 
+            case(score, redundancy) => new FeatureScore().init(score.toFloat) -> redundancy
           }.collect()
     val pool: Array[Option[(FeatureScore, Vector)]] = Array.fill(nFeat)(None)
-    actualWeights.foreach{ case (id, score) => pool(id) = Some(score) }
-    // Get the maximum and initialize the set of selected features with it
-    var selected = Seq(reliefNoColl.head)
-    pool(selected.head.feat).get._1.valid = false
+    reliefRed.foreach{ case (id, score) => pool(id) = Some(score) }
+    // Get the best ranked feature and initialize the set of selected features with it
+    var selected: Seq[F] = Seq(stdRanking.head)
+    pool(selected.head.feat).get._1.valid = false // Can't be selected again
     var moreFeat = true
     
-    // Iterative process for redundancy and conditional redundancy
+    // Greedy iterative process to select numTopFeatures according to the trade-off relevance vs. redundancy
     while (selected.size < $(numTopFeatures) && moreFeat) {
 
-      // Update criteria with the new redundancy values      
+      // Update non-selected features by computing redundancy between them and the last selected feat.
       pool(selected.head.feat).get._2.foreachActive{ 
          case(k, v) => 
            if(pool(k).get._1.valid) 
              pool(k).get._1.update(v.toFloat)
       }
       
-      // select the best feature and remove from the whole set of features
+      // select the next best feature and remove from the non-selected set of features
       var max = new FeatureScore().init(Float.NegativeInfinity)
       val maxscore = max.score; var maxi = -1
       (0 until pool.size).foreach{ i => 
@@ -715,9 +728,10 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         moreFeat = false
       }
     }
-    (selected.reverse, reliefNoColl)  
+    (selected.reverse, stdRanking)  
   }
   
+  /** Inner class that annotates changes in relevance and redundancy in each feature during the selection process **/
   class FeatureScore extends Serializable {
     var relevance: Float = 0.0f
     var redundance: Float = 0.0f
@@ -766,11 +780,10 @@ object ReliefFRSelector extends DefaultParamsReadable[ReliefFRSelector] {
  */
 @Experimental
 final class ReliefFRSelectorModel private[ml] (
-  @Since("1.6.0") override val uid: String,
-  private val reliefFeatures: Array[Int],
-  private val reliefColFeatures: Array[Int]
-)
-    extends Model[ReliefFRSelectorModel] with ReliefFRSelectorParams with MLWritable {
+    @Since("1.6.0") override val uid: String,
+    private val stdSelection: Array[Int],
+    private val redundancySelection: Array[Int]
+  ) extends Model[ReliefFRSelectorModel] with ReliefFRSelectorParams with MLWritable {
 
   import ReliefFRSelectorModel._
   
@@ -778,10 +791,10 @@ final class ReliefFRSelectorModel private[ml] (
   def setInputCol(value: String): this.type = set(inputCol, value)
   def setRedundancyRemoval(value: Boolean): this.type = set(redundancyRemoval, value)
   
-  private var subset: Int = getSelectedFeatures().length
+  private var selectionSize: Int = getSelectedFeatures().length
   def setReducedSubset(s: Int): this.type =  {
     if(s > 0 && s <= getSelectedFeatures().length){
-      subset = s
+      selectionSize = s
     } else {
       System.err.println("The number of features in the subset must" +
         " be lower than the total number and greater than 0")
@@ -789,17 +802,17 @@ final class ReliefFRSelectorModel private[ml] (
     this
   }
   
-  def getReducedSubsetParam(): Int = subset
-  def getSelectedFeatures(): Array[Int] = if($(redundancyRemoval)) reliefColFeatures else reliefFeatures
+  def getReducedSubsetParam(): Int = selectionSize
+  def getSelectedFeatures(): Array[Int] = if($(redundancyRemoval)) redundancySelection else stdSelection
 
   override def transform(dataset: Dataset[_]): DataFrame = {
     val transformedSchema = transformSchema(dataset.schema, logging = true)
     val newField = transformedSchema.last
 
     // TODO: Make the transformer natively in ml framework to avoid extra conversion.
-    val sfeat = getSelectedFeatures().slice(0, subset).sorted
+    val selection: Array[Int] = getSelectedFeatures().slice(0, selectionSize).sorted
     // sfeat must be ordered asc
-    val transformer: Vector => Vector = v =>  FeatureSelectionUtils.compress(OldVectors.fromML(v), sfeat).asML
+    val transformer: Vector => Vector = v =>  FeatureSelectionUtils.compress(OldVectors.fromML(v), selection).asML
     val selector = udf(transformer)
 
     dataset.withColumn($(outputCol), selector(col($(inputCol))), newField.metadata)
@@ -818,16 +831,16 @@ final class ReliefFRSelectorModel private[ml] (
   private def prepOutputField(schema: StructType): StructField = {
     val origAttrGroup = AttributeGroup.fromStructField(schema($(inputCol)))
     val featureAttributes: Array[Attribute] = if (origAttrGroup.attributes.nonEmpty) {
-      origAttrGroup.attributes.get.zipWithIndex.filter(x => reliefFeatures.contains(x._2)).map(_._1)
+      origAttrGroup.attributes.get.zipWithIndex.filter(x => stdSelection.contains(x._2)).map(_._1)
     } else {
-      Array.fill[Attribute](reliefFeatures.size)(NumericAttribute.defaultAttr)
+      Array.fill[Attribute](stdSelection.size)(NumericAttribute.defaultAttr)
     }
     val newAttributeGroup = new AttributeGroup($(outputCol), featureAttributes)
     newAttributeGroup.toStructField()
   }
 
   override def copy(extra: ParamMap): ReliefFRSelectorModel = {
-    val copied = new ReliefFRSelectorModel(uid, reliefFeatures, reliefColFeatures)
+    val copied = new ReliefFRSelectorModel(uid, stdSelection, redundancySelection)
     copyValues(copied, extra).setParent(parent)
   }
 
@@ -840,11 +853,12 @@ object ReliefFRSelectorModel extends MLReadable[ReliefFRSelectorModel] {
 
   private[ReliefFRSelectorModel] class ReliefFRSelectorModelWriter(instance: ReliefFRSelectorModel) extends MLWriter {
 
-    private case class Data(reliefFeatures: Seq[Int], reliefColFeatures: Seq[Int])
+    private case class Data(stdSelection: Seq[Int], redundancySelection: Seq[Int])
 
+    // Save model to parquet file format (2 different sequences)
     override protected def saveImpl(path: String): Unit = {
       DefaultParamsWriter.saveMetadata(instance, path, sc)
-      val data = Data(instance.reliefFeatures.toSeq, instance.reliefColFeatures.toSeq)
+      val data = Data(instance.stdSelection.toSeq, instance.redundancySelection.toSeq)
       val dataPath = new Path(path, "data").toString
       sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
     }
@@ -857,7 +871,7 @@ object ReliefFRSelectorModel extends MLReadable[ReliefFRSelectorModel] {
     override def load(path: String): ReliefFRSelectorModel = {
       val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
       val dataPath = new Path(path, "data").toString
-      val data = sparkSession.read.parquet(dataPath).select("reliefFeatures", "reliefColFeatures").head()
+      val data = sparkSession.read.parquet(dataPath).select("stdSelection", "redundancySelection").head()
       val reliefFeatures = data.getAs[Seq[Int]](0).toArray
       val reliefColFeatures = data.getAs[Seq[Int]](1).toArray
       val model = new ReliefFRSelectorModel(metadata.uid, reliefFeatures, reliefColFeatures)

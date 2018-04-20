@@ -21,38 +21,6 @@ class ReliefSelectorSuite extends FunSuite with BeforeAndAfterAll {
     sqlContext = new SQLContext(SPARK_CTX)
   }
   
-  /** Do mRMR feature selection on COLON data. */
-  test("Run RELIEF-F on colon data (nfeat = 10)") {
-
-    val df = readCSVData(sqlContext, "test_colon_s3.csv")
-    val cols = df.columns
-    val pad = 2
-    val allVectorsDense = true
-    val discreteData = true
-    val model = getSelectorModel(sqlContext, df, cols.drop(1), cols.head, 
-        10, discreteData, allVectorsDense, pad)
-
-    assertResult("1422, 248, 74, 244, 266, 764, 1413, 1771, 1152, 779") {
-      model.getSelectedFeatures.mkString(", ")
-    }
-  }
-  
-  /** Do mRMR feature selection on LEUKEMIA data. */
-  test("Run RELIEF-F on leukemia data (nfeat = 10)") {
-
-    val df = readCSVData(sqlContext, "test_leukemia_s3.csv")
-    val cols = df.columns
-    val pad = 2
-    val allVectorsDense = true
-    val discreteData = true
-    val model = getSelectorModel(sqlContext, df, cols.drop(1), cols.head, 
-        10, discreteData, allVectorsDense, pad)
-
-    assertResult("1084, 1719, 1774, 1822, 2061, 2294, 3192, 4387, 4787, 6795") {
-      model.getSelectedFeatures.mkString(", ")
-    }
-  }
-  
   /** Do mRMR feature selection on LUNG data. */
   test("Run RELIEF-F on lung data (nfeat = 10)") {
 
@@ -65,41 +33,23 @@ class ReliefSelectorSuite extends FunSuite with BeforeAndAfterAll {
     val model = getSelectorModel(sqlContext, df, cols.drop(1), cols.head, 
         10, discreteData, allVectorsDense, pad)
 
-    assertResult("18, 22, 29, 125, 132, 150, 166, 242, 243, 269") {
+    assertResult("29, 223, 10, 19, 172, 55, 183, 23, 35, 56") {
       model.getSelectedFeatures.mkString(", ")
     }
   }
+  
+  /** Do mRMR feature selection on COLON data. */
+  test("Run RELIEF-F on colon data (nfeat = 10)") {
 
-  /** Do mRMR feature selection on LYMPHOMA data. */
-  test("Run RELIEF-F on lymphoma data (nfeat = 10)") {
-
-    val df = readCSVData(sqlContext, "test_lymphoma_s3.csv")
+    val df = readCSVData(sqlContext, "test_colon_s3.csv")
     val cols = df.columns
     val pad = 2
     val allVectorsDense = true
     val discreteData = true
-    
     val model = getSelectorModel(sqlContext, df, cols.drop(1), cols.head, 
         10, discreteData, allVectorsDense, pad)
 
-    assertResult("236, 393, 759, 2747, 2818, 2841, 2862, 3014, 3702, 3792") {
-      model.getSelectedFeatures.mkString(", ")
-    }
-  }
-
-  /** Do mRMR feature selection on NCI data. */
-  test("Run RELIEF-F on nci data (nfeat = 10)") {
-
-    val df = readCSVData(sqlContext, "test_nci9_s3.csv")
-    val cols = df.columns
-    val pad = 2
-    val allVectorsDense = true
-    val discreteData = true
-    
-    val model = getSelectorModel(sqlContext, df, cols.drop(1), cols.head, 
-        10, discreteData, allVectorsDense, pad)
-
-    assertResult("443, 755, 1369, 1699, 3483, 5641, 6290, 7674, 9399, 9576") {
+    assertResult("1422, 248, 74, 244, 266, 764, 1413, 1771, 1152, 779") {
       model.getSelectedFeatures.mkString(", ")
     }
   }
